@@ -1,3 +1,6 @@
 .env
 __pycache__/
 venv/
+
+# indice vetorial gerado pelo RAG (reconstruido com: python -m api.llm.indexar)
+api/vectorstore/
