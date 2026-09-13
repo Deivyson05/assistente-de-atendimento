@@ -1,218 +1,310 @@
+"""Orquestração do assistente: RAG para dúvidas + fluxo conversacional de agendamento.
+
+Pipeline executado a cada mensagem (etapas 6 a 10):
+
+    pergunta -> reformulação -> recuperação -> decisão de evidência
+             -> contexto -> LLM -> (comando JSON -> ferramenta -> LLM)* -> resposta
+
+A decisão de evidência é a aresta condicional do material: se a busca vetorial
+não trouxe nada suficientemente próximo e o turno é uma pergunta, o assistente
+se abstém sem nem chamar a LLM.
+"""
+
 import json
-from multiprocessing import context
 import re
-from anthropic import Anthropic
+import time
+
 from groq import Groq
-from api.settings import settings
-from api.services.prestador_service import PrestadorService
+
+from api.llm.carregar_servicos import carregar_servicos
+from api.llm.prompt import build_system_prompt
+from api.llm.retriever import RESPOSTA_SEM_EVIDENCIA, Retriever
+from api.llm.vectorstore import construir_indice
 from api.services.horario_marcado_service import HorarioMarcadoService
-import chromadb
-from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
-from pypdf import PdfReader
-from pathlib import Path
+from api.services.prestador_service import PrestadorService
+from api.settings import settings
+
+# Marcador usado para devolver o resultado de uma ferramenta ao modelo.
+# É removido da entrada do usuário para que ninguém consiga forjar um resultado.
+MARCADOR_FERRAMENTA = "[RESULTADO_FERRAMENTA]"
+
+_BLOCO_JSON = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
+_JSON_SOLTO = re.compile(r'\{\s*"action"\s*:.*?\}', re.DOTALL)
+
+_PALAVRAS_AGENDAMENTO = (
+    "agendar", "agendamento", "marcar", "remarcar", "desmarcar", "cancelar",
+    "consulta", "horario", "horário", "disponibilidade", "vaga",
+)
+_INTERROGATIVAS = (
+    "qual", "quais", "quanto", "quando", "onde", "como", "porque", "por que",
+    "quem", "posso", "pode", "tem", "vocês", "voces", "existe", "precisa",
+    "aceita", "atende", "funciona", "o que",
+)
+
+# Serviços mudam pouco; evita uma consulta ao banco a cada chamada da LLM.
+_TTL_SERVICOS = 300
+
 
 class ChatService:
-    def __init__(self, prestador_service: PrestadorService, horario_marcado_service: HorarioMarcadoService, docs_folder: str = "./api/docs"):
+    def __init__(
+        self,
+        prestador_service: PrestadorService,
+        horario_marcado_service: HorarioMarcadoService,
+        docs_folder: str | None = None,
+    ):
         self.client = Groq(api_key=settings.llm_api_key)
         self.prestador_service = prestador_service
         self.horario_marcado_service = horario_marcado_service
-        self.histories = {}
-        self.vectorstore = self._build_index(docs_folder)
-        
-    def _carregar_servicos(self) -> str:
+        self.docs_folder = docs_folder or settings.rag_docs_folder
+
+        # sessoes[session_id] = {"historico": [...], "em_agendamento": bool}
+        self.sessoes: dict[str, dict] = {}
+
+        self._retriever: Retriever | None = None
+        self._servicos_cache: tuple[float, str] | None = None
+
+    # ------------------------------------------------------------------
+    # Índice vetorial (etapas 4 e 5)
+    # ------------------------------------------------------------------
+    @property
+    def retriever(self) -> Retriever:
+        """Índice carregado na primeira utilização, não no import do módulo."""
+        if self._retriever is None:
+            colecao = construir_indice(
+                pasta_docs=self.docs_folder,
+                caminho_indice=settings.rag_index_path,
+                modelo=settings.rag_embedding_model,
+                chunk_tamanho=settings.rag_chunk_tamanho,
+                chunk_overlap=settings.rag_chunk_overlap,
+            )
+            self._retriever = Retriever(
+                colecao,
+                top_k=settings.rag_top_k,
+                limiar=settings.rag_limiar_evidencia,
+            )
+        return self._retriever
+
+    def preparar_indice(self) -> None:
+        """Força a construção do índice (usado no startup da API)."""
+        _ = self.retriever
+
+    # ------------------------------------------------------------------
+    # Sessão e histórico
+    # ------------------------------------------------------------------
+    def _sessao(self, session_id: str) -> dict:
+        if session_id not in self.sessoes:
+            self.sessoes[session_id] = {"historico": [], "em_agendamento": False}
+        return self.sessoes[session_id]
+
+    def _janela(self, historico: list[dict]) -> list[dict]:
+        limite = settings.historico_max_mensagens
+        return historico[-limite:] if len(historico) > limite else historico
+
+    def _perguntas_anteriores(self, historico: list[dict]) -> list[str]:
+        return [
+            m["content"]
+            for m in historico
+            if m["role"] == "user" and not m["content"].startswith(MARCADOR_FERRAMENTA)
+        ]
+
+    def _servicos(self) -> str:
+        agora = time.time()
+        if self._servicos_cache and agora - self._servicos_cache[0] < _TTL_SERVICOS:
+            return self._servicos_cache[1]
+        servicos = carregar_servicos()
+        self._servicos_cache = (agora, servicos)
+        return servicos
+
+    # ------------------------------------------------------------------
+    # Classificação do turno
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _sanitizar(mensagem: str) -> str:
+        """Impede que o usuário finja ser um resultado de ferramenta."""
+        return mensagem.replace(MARCADOR_FERRAMENTA, "[marcador removido]").strip()
+
+    @staticmethod
+    def _parece_agendamento(mensagem: str) -> bool:
+        texto = mensagem.lower()
+        return any(palavra in texto for palavra in _PALAVRAS_AGENDAMENTO)
+
+    @staticmethod
+    def _parece_pergunta(mensagem: str) -> bool:
+        texto = mensagem.lower().strip()
+        if "?" in texto:
+            return True
+        return any(texto.startswith(p) for p in _INTERROGATIVAS)
+
+    # ------------------------------------------------------------------
+    # Ferramentas (tool calling manual por JSON)
+    # ------------------------------------------------------------------
+    def _extrair_acao(self, resposta: str) -> tuple[dict | None, str]:
+        """Devolve (ação, texto sem o bloco JSON).
+
+        Só a primeira ação é considerada — o prompt pede um comando por resposta.
+        O texto limpo é o que vai para a tela caso a ação não possa ser executada,
+        para que o JSON cru nunca apareça para o cliente.
+        """
+        encontrado = _BLOCO_JSON.search(resposta)
+        bruto = encontrado.group(1) if encontrado else None
+
+        if not encontrado:
+            encontrado = _JSON_SOLTO.search(resposta)
+            bruto = encontrado.group(0) if encontrado else None
+
+        if not encontrado:
+            return None, resposta
+
+        texto_limpo = resposta.replace(encontrado.group(0), "").strip()
+
         try:
-            from api.database import SessionLocal
-            from api.models.prestador import Prestador
-            db = SessionLocal()
-            try:
-                servicos = db.query(Prestador.servico).distinct().all()
-                return "\n".join([f"- {s[0]}" for s in servicos])
-            finally:
-                db.close()
-        except Exception as e:
-            print(f"Erro ao carregar serviços: {e}")
-            return "- Consulte os serviços disponíveis"
+            dados = json.loads(bruto)
+        except json.JSONDecodeError as erro:
+            print(f"[CHAT] JSON inválido emitido pelo modelo: {erro}")
+            return None, texto_limpo or resposta
 
-    def _executar_tool(self, tool_name: str, args: dict) -> str:
-        if tool_name == "get_prestadores_servico":
-            prestadores = self.prestador_service.get_by_servico(args["servico"])
-            return json.dumps([
-                {"id": p.id, "nome": p.nome, "servico": p.servico} for p in prestadores
-            ], ensure_ascii=False)
-        
-        if tool_name == "get_horarios_ocupados":
-            horarios = self.horario_marcado_service.get_by_prestador_e_data(args["prestador_id"], args["data"])
-            return json.dumps([h.horario for h in horarios])
-        
-        if tool_name == "agendar":
-            from api.schemas.horario_marcado_schema import HorarioMarcadoCreate
-            self.horario_marcado_service.create(HorarioMarcadoCreate(**args))
-            return json.dumps({"sucesso": True})
-        
-        return json.dumps({"error": "Tool não encontrada"})
-        
-    def _load_documents(self, folder: str) -> list[dict]:
-        
-        docs = []
-        for path in Path(folder).rglob("*"):
-            if path.suffix == ".pdf":
-                reader = PdfReader(path)
-                text = "\n".join(p.extract_text() or "" for p in reader.pages)
-                print(f"=== {path.name} ===")
-                print(text)  # ← vê o que está extraindo
-                print("==================")
-            elif path.suffix in (".txt", ".md"):
-                text = path.read_text(encoding="utf-8")
-            else:
-                continue
-            docs.append({"source": str(path), "text": text})
-            print(f"Documentos carregados: {len(docs)}")
-            for d in docs:
-                print(f" - {d['source']} ({len(d['text'])} chars)")
-        return docs
-    
-    def _chunk(self, text: str, size: int = 500, overlap: int = 50) -> list[str]:
-        chunks, start = [], 0
-        while start < len(text):
-            chunks.append(text[start:start+size])
-            start += size - overlap
-        return chunks
-    
-    def _build_index(self, folder: str) -> chromadb.Client:
-        ef = SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
-        client = chromadb.Client()
-        collection = client.get_or_create_collection("docs", embedding_function=ef)
+        if not isinstance(dados, dict) or "action" not in dados:
+            return None, texto_limpo or resposta
+        return dados, texto_limpo
 
-        if collection.count() > 0:
-            return collection
-        
-        for doc in self._load_documents(folder):
-            for i, chunk in enumerate(self._chunk(doc["text"])):
-                collection.add(
-                    ids=[f"{doc['source']}_{i}"],
-                    documents=[chunk],
-                    metadatas=[{"source": doc["source"]}]
-                )
-        return collection
-        
-    def _retrieve(self, query: str, k: int = 5) -> str:
-        results = self.vectorstore.query(query_texts=[query], n_results=k)
-        chunks = results["documents"][0]
-        return "\n\n---\n\n".join(chunks)
-    
-    def _build_system_prompt(self, context: str) -> str:
-        return (
-            f"""
-            Você é Mika, um assistente de agendamento da clínica Mika Odonto.
+    def _executar_tool(self, acao: dict) -> str:
+        nome = acao.get("action")
 
-            ### Informações da clínica:
-            {context}
+        if nome == "get_prestadores_servico":
+            prestadores = self.prestador_service.get_by_servico(acao["servico"])
+            return json.dumps(
+                [
+                    {"id": p.id, "nome": p.nome, "servico": p.servico}
+                    for p in prestadores
+                ],
+                ensure_ascii=False,
+            )
 
-            ### Serviços disponíveis (use EXATAMENTE esses nomes):
-            {self._carregar_servicos()}
+        if nome == "get_horarios_ocupados":
+            horarios = self.horario_marcado_service.get_by_prestador_e_data(
+                acao["prestador_id"], acao["data"]
+            )
+            # data_hora chega como "YYYY-MM-DD HH:MM"; o modelo só precisa da hora.
+            return json.dumps(
+                [str(h.data_hora).split(" ")[-1][:5] for h in horarios],
+                ensure_ascii=False,
+            )
 
-            ### Comandos disponíveis (use UM por resposta, sem texto depois do JSON):
-            Buscar prestadores:
-            ```json
-            {{"action": "get_prestadores_servico", "servico": "nome exato do serviço"}}
-            ```
+        if nome == "agendar":
+            return self._agendar(acao)
 
-            Verificar horários ocupados:
-            ```json
-            {{"action": "get_horarios_ocupados", "prestador_id": <id retornado pelo get_prestadores_servico>, "data": "YYYY-MM-DD"}}
-            ```
+        return json.dumps({"erro": "Ferramenta não encontrada"}, ensure_ascii=False)
 
-            Agendar (SOMENTE após confirmação explícita do usuário):
-            ```json
-            {{"action": "agendar", "nome": "...", "email": "...", "telefone": "...", "prestador_id": <id retornado pelo get_prestadores_servico>, "data": "YYYY-MM-DD", "hora": "HH:MM", "servico": "..."}}
-            ```
-            IMPORTANTE: prestador_id deve ser o ID real retornado pela busca de prestadores, nunca invente.
+    def _agendar(self, acao: dict) -> str:
+        from api.schemas.horario_marcado_schema import HorarioMarcadoCreate
 
-            ### REGRAS OBRIGATÓRIAS:
-            - NUNCA pule etapas
-            - NUNCA agende sem confirmação explícita do usuário
-            - NUNCA invente prestadores ou horários
-            - Mande apenas UM bloco JSON por resposta
-            - SEMPRE espere o resultado antes de continuar
+        self.horario_marcado_service.create(
+            HorarioMarcadoCreate(
+                prestador_id=acao["prestador_id"],
+                cliente_nome=acao["nome"],
+                cliente_email=acao["email"],
+                cliente_telefone=acao["telefone"],
+                data_hora=f"{acao['data']} {acao['hora']}",
+            )
+        )
+        return json.dumps({"sucesso": True}, ensure_ascii=False)
 
-            ### Fluxo OBRIGATÓRIO na ordem:
-            1. Colete nome completo, email e telefone
-            2. Pergunte serviço e data
-            3. Mande o JSON de get_prestadores_servico e PARE — espere o resultado
-            4. Apresente os prestadores reais ao usuário e pergunte qual prefere
-            5. Mande o JSON de get_horarios_ocupados e PARE — espere o resultado
-            6. Apresente os horários livres e pergunte qual prefere
-            7. Faça um resumo completo e pergunte "Confirma o agendamento?"
-            8. SOMENTE se o usuário disser sim, mande o JSON de agendar
-            """
-            
+    # ------------------------------------------------------------------
+    # Geração (etapa 9)
+    # ------------------------------------------------------------------
+    def _chamar_llm(self, system_prompt: str, historico: list[dict]) -> str:
+        resposta = self.client.chat.completions.create(
+            model=settings.llm_model,
+            messages=[{"role": "system", "content": system_prompt}]
+            + self._janela(historico),
+            temperature=settings.llm_temperature,
+            max_tokens=settings.llm_max_tokens,
+        )
+        return resposta.choices[0].message.content or ""
+
+    # ------------------------------------------------------------------
+    # Entrada principal (etapas 6 a 10)
+    # ------------------------------------------------------------------
+    def send_message(self, message: str, session_id: str = "default") -> str:
+        sessao = self._sessao(session_id)
+        historico = sessao["historico"]
+
+        mensagem = self._sanitizar(message)
+
+        # --- Etapa 6.5: reformulação da pergunta com o histórico ---
+        query = self.retriever.montar_query(
+            mensagem, self._perguntas_anteriores(historico)
         )
 
-    def send_message(self, message: str, session_id: str = "default") -> str:
-        if session_id not in self.histories:
-            self.histories[session_id] = []
+        # --- Etapa 7: recuperação ---
+        recuperados = self.retriever.recuperar(query)
+        com_evidencia = self.retriever.decidir_evidencia(recuperados)
+        score = self.retriever.score_maximo(recuperados)
 
-        history = self.histories[session_id]
-        print(f"Session: {session_id}")
-        print(f"Histórico atual: {len(history)} mensagens")
-        print(f"IDs de sessões salvas: {list(self.histories.keys())}")
-        context = self._retrieve(message)
-        
+        turno_agendamento = sessao["em_agendamento"] or self._parece_agendamento(mensagem)
+        if turno_agendamento:
+            sessao["em_agendamento"] = True
 
-        if message:
-            context = self._retrieve(message)
-            self.histories[f"{session_id}_context"] = context
-            history.append({"role": "user", "content": message})
-        else:
-            context = self.histories.get(f"{session_id}_context", "")
-
-        system = {"role": "system", "content": self._build_system_prompt(context)}
-
-        response = self.client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=[system] + history,
+        if settings.debug:
+            print(
+                f"[RAG] sessao={session_id} score_max={score:.4f} "
+                f"limiar={settings.rag_limiar_evidencia} evidencia={com_evidencia} "
+                f"agendamento={turno_agendamento} query={query!r}"
             )
-        
-        reply = response.choices[0].message.content
-        history.append({"role": "assistant", "content": reply})
 
-        try:
-            matches = re.findall(r'```json\s*(.*?)\s*```', reply, re.DOTALL)
-            print(f"Matches encontrados: {len(matches)}")  # ← quantos JSONs achou?
-            
-            if matches:
-                for json_str in matches:
-                    print(f"JSON bruto: {json_str}")
-                    dados = json.loads(json_str.strip())
-                    print(f"Dados parsed: {dados}") 
-                    action = dados.get("action")
-                    print(f"Action: {action}")
+        historico.append({"role": "user", "content": mensagem})
 
-                if action == "get_prestadores_servico":
-                    resultado = self._executar_tool("get_prestadores_servico", {"servico": dados["servico"]})
-                    print(f"Prestadores raw: {resultado}")
-                    
-                    history.append({"role": "user", "content": f"Resultado da busca de prestadores: {resultado}"})
-                    return self.send_message("", session_id)
-                elif action == "get_horarios_ocupados":
-                    resultado = self._executar_tool("get_horarios_ocupados", {"prestador_id": dados["prestador_id"], "data": dados["data"]})
-                    print(f"Horários raw: {resultado}")
-                    history.append({"role": "user", "content": f"Resultado da busca de horários ocupados: {resultado}"})
-                    return self.send_message("", session_id)
-                elif action == "agendar":
-                    from api.schemas.horario_marcado_schema import HorarioMarcadoCreate
-                    self.horario_marcado_service.create(HorarioMarcadoCreate(
-                        cliente_nome=dados["nome"],
-                        cliente_email=dados["email"],
-                        cliente_telefone=dados["telefone"],
-                        prestador_id=dados["prestador_id"],
-                        data_hora=f"{dados['data']} {dados['hora']}",
-                        servico=dados["servico"]
-                    ))
-                    return "Agendamento realizado com sucesso! ✅"
-                
-        except Exception as e:
-            print(f"Erro ao processar a mensagem: {e}")
-            pass
+        # --- Nó de abstenção: pergunta sem evidência não chega a chamar a LLM ---
+        if not com_evidencia and not turno_agendamento and self._parece_pergunta(mensagem):
+            historico.append({"role": "assistant", "content": RESPOSTA_SEM_EVIDENCIA})
+            return RESPOSTA_SEM_EVIDENCIA
 
-        return reply
+        # --- Etapa 8: montagem do contexto ---
+        relevantes = self.retriever.filtrar_relevantes(recuperados) if com_evidencia else []
+        contexto = self.retriever.montar_contexto(relevantes)
+        system_prompt = build_system_prompt(contexto, self._servicos())
+
+        # --- Etapas 9 e 10: geração, com rodadas de ferramenta quando necessário ---
+        for passo in range(settings.max_passos_ferramenta + 1):
+            try:
+                resposta = self._chamar_llm(system_prompt, historico)
+            except Exception as erro:
+                print(f"[CHAT] Falha na chamada da LLM: {erro}")
+                return (
+                    "Tive um problema para processar sua mensagem agora. "
+                    "Pode tentar novamente em instantes?"
+                )
+
+            historico.append({"role": "assistant", "content": resposta})
+            acao, texto_limpo = self._extrair_acao(resposta)
+
+            if acao is None:
+                return texto_limpo or resposta
+
+            if passo == settings.max_passos_ferramenta:
+                print("[CHAT] Limite de passos de ferramenta atingido.")
+                return (
+                    "Não consegui concluir essa operação agora. "
+                    "Pode repetir o que você precisa?"
+                )
+
+            try:
+                resultado = self._executar_tool(acao)
+            except Exception as erro:
+                print(f"[CHAT] Erro ao executar {acao.get('action')}: {erro}")
+                resultado = json.dumps(
+                    {"erro": "não foi possível executar a operação"}, ensure_ascii=False
+                )
+
+            if acao.get("action") == "agendar" and '"sucesso": true' in resultado.lower():
+                sessao["em_agendamento"] = False
+                sucesso = "Agendamento realizado com sucesso! ✅"
+                historico.append({"role": "assistant", "content": sucesso})
+                return sucesso
+
+            historico.append({
+                "role": "user",
+                "content": f"{MARCADOR_FERRAMENTA} {acao['action']}: {resultado}",
+            })
+
+        return "Não consegui concluir essa operação agora."
