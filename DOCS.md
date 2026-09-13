@@ -3,9 +3,9 @@
 
 ## Visão Geral
 
-O Mika AI é uma plataforma de atendimento automatizado com Inteligência Artificial capaz de responder dúvidas com base em documentos internos da empresa e conduzir fluxos de agendamento de forma conversacional.
+O Mika AI é uma plataforma de atendimento automatizado com Inteligência Artificial capaz de responder dúvidas com base em documentos internos da empresa (RAG) e conduzir fluxos de agendamento de forma conversacional.
 
-Para demonstrar a solução, foi utilizado um cenário fictício de clínica odontológica, mas a arquitetura foi pensada para ser adaptável a outros contextos de atendimento.
+Para demonstrar a solução, foi utilizado um cenário fictício de clínica odontológica, mas a arquitetura foi pensada para ser adaptável a outros contextos de atendimento: trocar os PDFs da pasta de documentos é suficiente para mudar de domínio.
 
 ---
 
@@ -25,55 +25,121 @@ Empresas frequentemente enfrentam desafios com:
 
 A solução utiliza IA para:
 
-- Responder perguntas com base em documentos da empresa (RAG);
+- Responder perguntas com base nos documentos da empresa (RAG);
+- Recusar-se a responder quando a base não sustenta a resposta;
+- Citar a fonte utilizada em cada resposta;
 - Conduzir fluxos conversacionais para agendamento;
-- Coletar informações obrigatórias do cliente;
-- Validar disponibilidade e conflitos de horário;
-- Sugerir horários alternativos quando necessário.
+- Coletar as informações obrigatórias do cliente;
+- Consultar prestadores e horários reais no banco de dados.
 
 ---
 
-# Funcionalidades
+# Pipeline de RAG
 
-## Atendimento com IA
-- Respostas contextualizadas usando PDFs da empresa
-- Consulta de informações institucionais
-- Fluxo conversacional multi-turn
+O núcleo da aplicação é o pipeline abaixo. Cada etapa corresponde a um módulo do pacote `api/llm/`.
 
-## Agendamento Inteligente
-- Coleta de:
-  - Nome
-  - E-mail
-  - Telefone
-  - Serviço
-  - Data
-  - Horário
+| # | Etapa | Módulo responsável |
+|---|---|---|
+| 1 | Coleta do conteúdo do domínio | `load_documents.py` |
+| 2 | Limpeza e organização dos textos | `limpeza.py` |
+| 3 | Quebra do conteúdo em chunks | `chunk.py` |
+| 4 | Geração de embeddings | `vectorstore.py` |
+| 5 | Armazenamento em índice vetorial | `vectorstore.py` |
+| 6 | Recebimento da pergunta pela interface | `chat_router.py` / `chat.tsx` |
+| 7 | Recuperação dos chunks mais relevantes | `retriever.py` |
+| 8 | Montagem do contexto (chunks + histórico) | `retriever.py` / `chat_service.py` |
+| 9 | Geração da resposta final | `prompt.py` / `chat_service.py` |
+| 10 | Exibição da resposta no chat | `chat.tsx` |
 
-## Validações
-- Horário dentro do expediente
-- Conflito com agenda existente
-- Sugestão de novos horários
+## 1. Coleta
+
+Leitura dos PDFs de `api/docs/` com `pypdf`. Cada documento recebe identidade própria — `id`, `titulo` e `fonte` — que é propagada por todo o pipeline até a citação na resposta final.
+
+## 2. Limpeza
+
+O texto extraído de um PDF carrega ruído de diagramação que degrada o embedding. São removidos:
+
+- cabeçalho e rodapé, detectados por repetição **nas primeiras e últimas linhas** de cada página;
+- linhas que contêm apenas número de página;
+- quebras de linha no meio de frases (preservando a separação de parágrafos);
+- hifenização de fim de linha (`odonto-\nlogia` → `odontologia`).
+
+A detecção atua apenas na borda da página, e não na página inteira, justamente para não apagar conteúdo legítimo: palavras curtas e números soltos (número de rua, CEP) também se repetem entre páginas. Medido na base atual, a limpeza remove **1,2%** do texto.
+
+## 3. Chunking
+
+Divisão **por palavra** (não por caractere, que partiria palavras ao meio), com identidade preservada: `chunk_id`, `documento_id`, `titulo` e `fonte`.
+
+Padrão: **70 palavras com 15 de sobreposição**. O tamanho não é arbitrário — o modelo de embedding tem janela de 128 tokens, e em português uma palavra gera de 1,5 a 2 tokens. Chunks maiores seriam truncados silenciosamente na hora de gerar o vetor, deixando parte do conteúdo fora do índice. A sobreposição evita que uma informação na fronteira entre dois chunks se perca.
+
+## 4. Embeddings
+
+Modelo: **`sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`**.
+
+A escolha do modelo multilíngue é decisiva: os documentos estão em português, e um modelo treinado apenas em inglês produz similaridades próximas do ruído para esse conteúdo. Os vetores são normalizados e gerados em lote.
+
+## 5. Índice vetorial
+
+ChromaDB em modo **persistente** (`PersistentClient`), gravado em `api/vectorstore/`, com espaço de distância `cosine`.
+
+O índice guarda uma impressão digital da pasta de documentos (nome, tamanho e data de modificação de cada arquivo) junto com o modelo e os parâmetros de chunking. Se qualquer PDF for adicionado, removido ou alterado, o índice é reconstruído automaticamente na próxima execução; caso contrário, é reaproveitado.
+
+## 6. Recebimento da pergunta
+
+`POST /chat/` recebe `{ message, session_id }`. O `session_id` é gerado no navegador e guardado em `localStorage`, mantendo o histórico da conversa entre mensagens.
+
+## 7. Recuperação
+
+Busca vetorial pelos `top_k` chunks mais próximos, preservando **score e metadados**.
+
+Dois mecanismos são aplicados sobre o resultado:
+
+**Reformulação da pergunta.** Perguntas curtas costumam ser anafóricas — "e quanto custa?" não carrega assunto nenhum. Quando a mensagem tem menos de 6 palavras, a pergunta anterior do usuário é concatenada antes de gerar o vetor de busca.
+
+**Limiar de evidência.** A busca vetorial *sempre* devolve os vizinhos mais próximos, mesmo quando nenhum deles responde à pergunta. O score máximo é comparado com um limiar configurável; abaixo dele, considera-se que não há evidência. Chunks muito abaixo do topo do ranking também são descartados, porque só consomem contexto.
+
+## 8. Montagem do contexto
+
+Os chunks aprovados viram um contexto rotulado por fonte:
+
+```
+[Fonte 1 - Pagamentos, Orçamentos e Convênios]
+<trecho do documento>
+```
+
+Ao contexto soma-se uma janela das últimas mensagens da conversa, limitada para não crescer indefinidamente.
+
+## 9. Geração
+
+Groq com Llama 3.3 70B, `temperature=0.1` (em RAG a resposta deve seguir o contexto, não ser criativa) e limite de tokens definido.
+
+O prompt do sistema obriga o modelo a responder somente com base no contexto, a citar `[Fonte X]` e a ignorar instruções embutidas na mensagem do usuário que tentem alterar essas regras.
+
+**Abstenção:** se não há evidência e o turno é uma pergunta, o assistente responde *"Não encontrei essa informação na base consultada."* sem sequer chamar a LLM. A abstenção é suprimida durante um agendamento em andamento, onde a mensagem do usuário é um dado do fluxo e não uma pergunta à base.
+
+## 10. Exibição
+
+A mensagem do usuário aparece imediatamente, há indicador de digitação enquanto a resposta é processada, e falhas de rede viram uma mensagem visível no chat. A conversa é persistida em `localStorage`.
 
 ---
 
 # Arquitetura
 
 ## Frontend
-- Aplicação web
-- Interface com chat integrado
-- Comunicação com API FastAPI
+- Next.js (App Router) com Tailwind
+- Chat integrado à página institucional
+- Comunicação com a API FastAPI
 
 ## Backend
-- Python
-- FastAPI
-- ChatService como camada de orquestração
+- Python + FastAPI
+- Camadas: `routers` → `controllers` → `services` → `repository` → `models`
+- `ChatService` como camada de orquestração
+- Pacote `api/llm/` com o pipeline de RAG
 
 ## IA
-- LLM para interpretação e condução do fluxo
-- RAG com:
-  - ChromaDB
-  - Embeddings
-  - PDFs indexados
+- Groq — Llama 3.3 70B (geração)
+- Sentence Transformers — MiniLM multilíngue (embeddings)
+- ChromaDB persistente (índice vetorial)
 
 ## Banco de Dados
 - PostgreSQL (Neon)
@@ -82,44 +148,39 @@ A solução utiliza IA para:
 
 # Fluxo da Aplicação
 
+```
 Usuário envia mensagem
-
-↓  
-
-Frontend envia para API
-
-↓
-
-ChatService decide:
-
-- dúvida → usa RAG
-- agendamento → executa fluxo conversacional
-
-↓
-
-IA pode gerar ações estruturadas (JSON)
-
-↓
-
-Backend intercepta o JSON e executa:
-
-- consulta prestadores
-- consulta disponibilidade
-- cria agendamento
-
-↓
-
-Resposta retorna ao usuário
+        ↓
+Frontend envia para a API
+        ↓
+ChatService reformula a pergunta com o histórico
+        ↓
+Recuperação no índice vetorial  →  score máximo
+        ↓
+        ├── sem evidência + é pergunta  →  abstenção (não chama a LLM)
+        │
+        └── com evidência ou agendamento
+                ↓
+        Monta contexto [Fonte X] + janela do histórico
+                ↓
+        LLM gera a resposta
+                ↓
+        ├── resposta em texto  →  devolve ao usuário
+        │
+        └── comando JSON  →  backend executa a ação
+                                ↓
+                        consulta prestadores
+                        consulta horários ocupados
+                        cria agendamento
+                                ↓
+                        realimenta a LLM (até 4 rodadas)
+```
 
 ---
 
 # Estratégia de Tool Calling
 
-Como o modelo utilizado não possuía suporte nativo a function/tool calling, foi implementada uma estratégia alternativa baseada em comandos estruturados em JSON gerados pelo prompt.
-
-Esses comandos são interceptados e convertidos pelo backend em ações reais.
-
-Exemplo:
+Como o modelo utilizado não possui suporte nativo a function/tool calling, foi implementada uma estratégia alternativa baseada em comandos estruturados em JSON gerados pelo prompt. Esses comandos são interceptados e convertidos pelo backend em ações reais.
 
 ```json
 {
@@ -128,133 +189,211 @@ Exemplo:
 }
 ```
 
+Ferramentas disponíveis: `get_prestadores_servico`, `get_horarios_ocupados` e `agendar`.
+
+Cuidados adotados na implementação:
+
+- **Limite de rodadas** (4 por mensagem), evitando laço infinito caso o modelo insista em emitir comandos;
+- **O JSON nunca chega ao usuário** — o bloco é removido do texto exibido;
+- **Resultados de ferramenta são realimentados com um marcador**, que é removido de qualquer mensagem digitada pelo usuário, impedindo que alguém forje um resultado falso para induzir um agendamento.
+
 ---
 
 # Estrutura do Projeto
 
 ```bash
-frontend/
+front-end/
+  app/
+  components/
+    chat.tsx
 
-backend/
+back-end/
   api/
+    llm/
+      limpeza.py          # etapa 2
+      load_documents.py   # etapa 1
+      chunk.py            # etapa 3
+      vectorstore.py      # etapas 4 e 5
+      retriever.py        # etapas 7 e 8
+      prompt.py           # etapa 9
+      carregar_servicos.py
+      indexar.py          # construção do índice via linha de comando
     services/
-      chat_service.py
+      chat_service.py     # orquestração
       prestador_service.py
       horario_marcado_service.py
-
+    routers/
+    controllers/
+    repository/
     models/
     schemas/
-    docs/
+    docs/                 # PDFs indexados
+    vectorstore/          # índice gerado (não versionado)
 ```
 
 ---
 
 # Tecnologias Utilizadas
 
-## Frontend
-- React
-
-## Backend
-- FastAPI
-- Python
-
-## IA
-- Groq
-- Llama 3.3 70B
-- ChromaDB
-- Sentence Transformers
-
-## Banco
-- PostgreSQL (Neon)
+| Camada | Tecnologia |
+|---|---|
+| Frontend | Next.js, React, Tailwind, Axios |
+| Backend | FastAPI, Python, SQLAlchemy, Pydantic |
+| Geração | Groq — Llama 3.3 70B |
+| Embeddings | Sentence Transformers — `paraphrase-multilingual-MiniLM-L12-v2` |
+| Índice vetorial | ChromaDB (persistente) |
+| Extração de PDF | pypdf |
+| Banco | PostgreSQL (Neon) |
 
 ---
 
 # Como Executar
-Abra o projeto no codespace
+
+Abra o projeto no Codespace.
 
 ## Backend
 
-```
+```bash
 cd back-end
 python -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-criar arquivo .env e adicionar as seguintes 
+Crie um arquivo `.env` com:
+
 ```
 llm_api_key=
 database_url=
 debug=True
 ```
-os parâmetros estão disponíveis no env enviado por email
 
-rodar
+Os parâmetros estão disponíveis no `.env` enviado por e-mail.
+
+### Construir o índice vetorial
+
+```bash
+python -m api.llm.indexar
 ```
+
+Na primeira execução o modelo de embeddings é baixado (~500 MB). O índice fica em `api/vectorstore/` e é reaproveitado nas execuções seguintes.
+
+### Calibrar o limiar de evidência
+
+O limiar decide quando o assistente responde e quando se abstém. O valor padrão é didático e **deve ser calibrado** para a base em uso:
+
+```bash
+python -m api.llm.indexar --testar "vocês aceitam convênio?"
+python -m api.llm.indexar --testar "qual é a capital da França?"
+```
+
+O comando mostra o score de cada chunk recuperado e a decisão tomada. O limiar adequado fica entre o menor score das perguntas que a base responde e o maior score das que ela não responde. Ajuste em `rag_limiar_evidencia` no `.env`, sem alterar código.
+
+### Subir a API
+
+```bash
 python -m uvicorn api.index:app --reload
 ```
-vá em portas e deixe a porta do backend como Public
----
+
+Vá em Portas e deixe a porta do backend como **Public**.
+
+Diagnóstico do RAG: `GET /chat/status` devolve quantidade de chunks indexados, modelo de embedding em uso, `top_k` e limiar.
 
 ## Frontend
 
 ```bash
-cd frontend
+cd front-end
 npm install
 npm run dev
 ```
 
-adicione um .env com o seguinte parâmetro
+Adicione um `.env` com:
+
 ```
 NEXT_PUBLIC_BACKENDAPI=
 ```
-no parâmetro adicione o link de conexão do servidor backend
-exemplo: https://fluffy-orbit-wwgjqqwpxg63566q-8000.app.github.dev
+
+Informe o link de conexão do servidor backend, por exemplo:
+`https://fluffy-orbit-wwgjqqwpxg63566q-8000.app.github.dev`
+
+---
+
+# Parâmetros configuráveis
+
+Todos opcionais no `.env`, com valores padrão no código:
+
+| Parâmetro | Padrão | Função |
+|---|---|---|
+| `rag_embedding_model` | `paraphrase-multilingual-MiniLM-L12-v2` | Modelo de embeddings |
+| `rag_top_k` | `5` | Chunks recuperados por pergunta |
+| `rag_limiar_evidencia` | `0.35` | Score mínimo para responder |
+| `rag_chunk_tamanho` | `70` | Palavras por chunk |
+| `rag_chunk_overlap` | `15` | Palavras de sobreposição |
+| `llm_model` | `llama-3.3-70b-versatile` | Modelo de geração |
+| `llm_temperature` | `0.1` | Criatividade da resposta |
+| `historico_max_mensagens` | `20` | Janela do histórico |
+| `max_passos_ferramenta` | `4` | Rodadas de tool calling por mensagem |
+
+Alterar `rag_embedding_model`, `rag_chunk_tamanho` ou `rag_chunk_overlap` invalida o índice, que é reconstruído automaticamente.
 
 ---
 
 # Demonstração do Caso de Uso
 
-Exemplo:
+**Dúvida respondida pela base:**
 
-Usuário:
-"Quero marcar uma consulta"
+> Usuário: "Vocês atendem aos sábados?"
+> Mika: responde com base no documento de Horários e Agendamento, citando a fonte.
 
-Sistema:
-- coleta dados
-- verifica prestadores
-- valida disponibilidade
-- confirma agendamento
+**Dúvida fora da base:**
+
+> Usuário: "Qual é a capital da França?"
+> Mika: "Não encontrei essa informação na base consultada."
+
+**Agendamento:**
+
+> Usuário: "Quero marcar uma consulta"
+> Mika: coleta nome, e-mail e telefone → pergunta serviço e data → consulta os prestadores reais no banco → apresenta as opções → consulta os horários ocupados → apresenta os livres → resume e pede confirmação → agenda.
 
 ---
 
 # Decisões Técnicas
 
-- Centralização da orquestração conversacional no ChatService
-- Implementação manual de tool calling por JSON
-- Uso de RAG para respostas contextualizadas
-- Persistência de agendamentos em banco relacional
+- **Modelo de embedding multilíngue**, sem o qual a recuperação em português não funciona;
+- **Índice persistente em disco**, para não regerar os embeddings a cada inicialização;
+- **Limiar de evidência com abstenção**, porque a busca vetorial sempre devolve algo e a ausência de resposta precisa ser uma decisão explícita;
+- **Chunking por palavra dimensionado pela janela do modelo**, evitando truncamento silencioso;
+- **Citação de fonte**, tornando a resposta auditável;
+- **Tool calling manual por JSON**, contornando a ausência de suporte nativo no modelo;
+- **Índice construído sob demanda**, e não no import do módulo, para o servidor subir imediatamente;
+- **Centralização da orquestração conversacional no ChatService**.
 
 ---
 
 # Limitações do MVP
 
-- Fluxo demonstrado em domínio específico (clínica)
-- Sem autenticação
-- Sem painel administrativo
+- O serviço escolhido não é persistido no agendamento — a tabela `horario_marcado` não possui essa coluna;
+- Não há validação de horário comercial nem de conflito de agenda no backend; a ordem do fluxo é garantida apenas pelo prompt, e o banco não possui restrição de unicidade por prestador e horário;
+- Histórico de conversa e sessões vivem na memória do processo, e são perdidos ao reiniciar;
+- O chat compartilha uma única sessão de banco entre requisições;
+- Sem autenticação e sem painel administrativo;
+- CORS liberado para qualquer origem;
+- O limiar de evidência precisa ser calibrado manualmente por domínio.
 
 ---
 
 # Possíveis Evoluções
 
-- Suporte multissetor
-- Painel administrativo
-- Function calling nativo
-- Agentes com ferramentas adicionais
+- Validação de expediente e de conflito de horário no backend, com restrição de unicidade no banco;
+- Persistência do histórico de conversa em banco;
+- Reordenação (re-ranking) dos chunks recuperados;
+- Conjunto de perguntas de avaliação para calibrar o limiar automaticamente;
+- Suporte multissetor com múltiplas bases documentais;
+- Painel administrativo;
+- Function calling nativo, quando o modelo oferecer suporte.
 
 ---
 
 # Autor
 
 Deivyson Ricardo Silva dos Santos
-
