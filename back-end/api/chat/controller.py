@@ -1,5 +1,7 @@
-from api.services.chat_service import ChatService
 from fastapi import HTTPException, status
+
+from api.chat.service import ChatService
+
 
 class ChatController:
     def __init__(self, service: ChatService):

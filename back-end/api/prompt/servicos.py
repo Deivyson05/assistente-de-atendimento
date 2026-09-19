@@ -1,4 +1,9 @@
-"""Lista de serviços ofertados, lida do banco (tabela prestador)."""
+"""Lista de serviços ofertados, lida do banco (tabela prestador).
+
+Fica em prompt/ e não em rag/ porque não é conteúdo indexado: é dado
+estrutural do negócio, injetado diretamente no prompt do sistema a cada
+chamada (ver prompt/mika.py e chat/service.py).
+"""
 
 FALLBACK = "- Consulte os serviços disponíveis com a recepção"
 

@@ -12,9 +12,7 @@ material da disciplina implementa como aresta condicional no LangGraph:
                                    -> sem_evidencia
 """
 
-from api.llm.vectorstore import similaridade
-
-RESPOSTA_SEM_EVIDENCIA = "Nao encontrei essa informacao na base consultada."
+from api.rag.embedding import similaridade
 
 # Perguntas curtas costumam ser anaforicas ("e o preco?", "e amanha?") e nao
 # carregam o assunto. Abaixo desse numero de palavras, a pergunta anterior do

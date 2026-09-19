@@ -11,7 +11,7 @@ from pathlib import Path
 
 from pypdf import PdfReader
 
-from api.llm.limpeza import limpar_paginas, limpar_texto
+from api.rag.cleaning import limpar_paginas, limpar_texto
 
 EXTENSOES_SUPORTADAS = {".pdf", ".txt", ".md"}
 
@@ -35,7 +35,7 @@ def _titulo_do_arquivo(caminho: Path) -> str:
     titulo = caminho.stem.replace("_", " ").strip()
     sem_prefixo = titulo.lower()
     if sem_prefixo.startswith(_PREFIXO_TITULO):
-        titulo = titulo[len(_PREFIXO_TITULO):].lstrip(" -\u2013\u2014")
+        titulo = titulo[len(_PREFIXO_TITULO):].lstrip(" -–—")
     return titulo.strip() or caminho.stem
 
 

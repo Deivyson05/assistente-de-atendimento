@@ -14,7 +14,11 @@ class Settings(BaseSettings):
     debug: bool = False  # valor padrão
 
     # --- Modelo de geração (Groq) ---
-    llm_model: str = "llama-3.3-70b-versatile"
+    # A Groq descontinuou a família Llama 3.x (llama-3.3-70b-versatile passou a
+    # devolver 404 model_not_found). gpt-oss-120b é o substituto mais próximo em
+    # porte/capacidade disponível na conta; veja `client.models.list()` para a
+    # lista atual caso a Groq mude o catálogo de novo.
+    llm_model: str = "openai/gpt-oss-120b"
     # Temperatura baixa: em RAG a resposta deve seguir o contexto, não ser criativa.
     llm_temperature: float = 0.1
     llm_max_tokens: int = 800

@@ -1,5 +1,6 @@
 from fastapi import FastAPI
-from api.routers import chat_router, prestador_router, horario_marcado_router
+from api.chat import router as chat_router
+from api.routers import prestador_router, horario_marcado_router
 from api.database import engine, Base
 from api.models import prestador, horario_marcado
 from fastapi.middleware.cors import CORSMiddleware

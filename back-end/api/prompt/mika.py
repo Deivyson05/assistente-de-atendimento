@@ -1,4 +1,4 @@
-"""Etapa 9 do pipeline de RAG: instruções de geração da resposta.
+"""Etapa 9 do pipeline de RAG: persona e instrucoes de geracao da resposta.
 
 O prompt anterior só tinha regras de agendamento — nada obrigava o modelo a se
 ater aos documentos. Aqui entram as regras de fidelidade ao contexto e de
@@ -13,7 +13,10 @@ Por isso o bloco de contexto é montado de forma diferente conforme a busca
 tenha ou não encontrado evidência.
 """
 
-from api.llm.retriever import RESPOSTA_SEM_EVIDENCIA
+# Resposta usada tanto aqui dentro do prompt (para o modelo copiar quando o
+# contexto não sustenta a resposta) quanto pelo chat, que devolve este mesmo
+# texto diretamente ao usuário sem sequer chamar a LLM quando não há evidência.
+RESPOSTA_SEM_EVIDENCIA = "Nao encontrei essa informacao na base consultada."
 
 _SEM_CONTEXTO = (
     "NENHUM TRECHO RELEVANTE FOI ENCONTRADO NA BASE PARA ESTA MENSAGEM.\n"

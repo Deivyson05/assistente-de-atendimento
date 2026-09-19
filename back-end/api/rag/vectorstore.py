@@ -1,52 +1,25 @@
-"""Etapas 4 e 5 do pipeline de RAG: embeddings e indice vetorial.
+"""Etapa 5 do pipeline de RAG: armazenamento em indice vetorial.
 
-Duas correcoes importantes em relacao a versao anterior:
-
-1. Modelo de embedding multilingue. O all-MiniLM-L6-v2 foi treinado em ingles;
-   com documentos em portugues a similaridade calculada era praticamente ruido.
-   paraphrase-multilingual-MiniLM-L12-v2 e o modelo usado no material da
-   disciplina justamente por entender portugues.
-
-2. Indice persistente. chromadb.Client() e efemero: vive na RAM do processo e
-   e reconstruido a cada restart. PersistentClient grava em disco, entao os
-   embeddings sao gerados uma vez e reaproveitados.
+Indice persistente. chromadb.Client() e efemero: vive na RAM do processo e e
+reconstruido a cada restart. PersistentClient grava em disco, entao os
+embeddings sao gerados uma vez e reaproveitados.
 
 O indice guarda a impressao digital da pasta de documentos. Se um PDF for
 adicionado, removido ou alterado, o indice e reconstruido automaticamente.
+
+Este modulo cuida apenas da persistencia; a geracao do embedding em si esta em
+embedding.py, e a leitura/chunking dos documentos em ingestion.py/chunking.py.
 """
 
 import chromadb
-from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
 
-from api.llm.chunk import criar_chunks
-from api.llm.load_documents import carregar_documentos, impressao_digital
+from api.rag.chunking import criar_chunks
+from api.rag.embedding import get_embedding_function
+from api.rag.ingestion import carregar_documentos, impressao_digital
 
 # Chroma tem limite pratico por chamada; enviar em lote e ordens de grandeza
 # mais rapido do que uma chamada por chunk.
 TAMANHO_LOTE = 256
-
-_embedding_function = None
-
-
-def get_embedding_function(modelo: str):
-    """Carrega o modelo de embedding uma unica vez por processo."""
-    global _embedding_function
-    if _embedding_function is None:
-        _embedding_function = SentenceTransformerEmbeddingFunction(
-            model_name=modelo,
-            normalize_embeddings=True,
-        )
-    return _embedding_function
-
-
-def similaridade(distancia: float) -> float:
-    """Converte a distancia de cosseno do Chroma em similaridade [-1, 1].
-
-    Com a colecao criada em hnsw:space=cosine, distancia = 1 - similaridade.
-    Esse valor e o equivalente ao score do IndexFlatIP do FAISS com vetores
-    normalizados, e e o numero comparado com o limiar de evidencia.
-    """
-    return 1.0 - float(distancia)
 
 
 def _metadados_do_indice(modelo: str, digital: str, tamanho: int, overlap: int) -> dict:

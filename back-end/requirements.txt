@@ -5,6 +5,7 @@ pydantic-settings
 sqlalchemy
 psycopg2-binary
 groq
+langgraph
 chromadb
 sentence-transformers
 pypdf

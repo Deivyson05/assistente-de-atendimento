@@ -1,11 +1,11 @@
 from fastapi import APIRouter
 
-from api.controllers.chat_controller import ChatController
+from api.chat.controller import ChatController
+from api.chat.service import ChatService
 from api.database import SessionLocal
 from api.repository.horario_marcado_repository import HorarioMarcadoRepository
 from api.repository.prestador_repository import PrestadorRepository
 from api.schemas.chat_schema import ChatRequest
-from api.services.chat_service import ChatService
 from api.services.horario_marcado_service import HorarioMarcadoService
 from api.services.prestador_service import PrestadorService
 
@@ -52,5 +52,5 @@ def status():
         "modelo_embedding": retriever.colecao.metadata.get("modelo_embedding"),
         "top_k": retriever.top_k,
         "limiar_evidencia": retriever.limiar,
-        "sessoes_ativas": len(servico.sessoes),
+        "sessoes_ativas": len(servico.sessions.sessoes),
     }

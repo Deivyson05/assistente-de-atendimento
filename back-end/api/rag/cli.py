@@ -1,9 +1,9 @@
 """Construção do índice vetorial fora do ciclo de request.
 
 Uso:
-    python -m api.llm.indexar            # indexa se houver mudança
-    python -m api.llm.indexar --forcar   # reconstrói do zero
-    python -m api.llm.indexar --testar "vocês atendem convênio?"
+    python -m api.rag.cli            # indexa se houver mudança
+    python -m api.rag.cli --forcar   # reconstrói do zero
+    python -m api.rag.cli --testar "vocês atendem convênio?"
 
 Rodar isso uma vez antes de subir o servidor evita que a primeira requisição
 pague o custo de ler os PDFs e gerar todos os embeddings.
@@ -11,8 +11,8 @@ pague o custo de ler os PDFs e gerar todos os embeddings.
 
 import sys
 
-from api.llm.retriever import Retriever
-from api.llm.vectorstore import construir_indice
+from api.rag.retrieval import Retriever
+from api.rag.vectorstore import construir_indice
 from api.settings import settings
 
 
@@ -25,7 +25,7 @@ def main() -> int:
         if posicao + 1 < len(sys.argv):
             pergunta = sys.argv[posicao + 1]
         else:
-            print("Uso: python -m api.llm.indexar --testar \"sua pergunta\"")
+            print("Uso: python -m api.rag.cli --testar \"sua pergunta\"")
             return 1
 
     colecao = construir_indice(

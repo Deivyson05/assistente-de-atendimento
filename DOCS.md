@@ -36,20 +36,22 @@ A solução utiliza IA para:
 
 # Pipeline de RAG
 
-O núcleo da aplicação é o pipeline abaixo. Cada etapa corresponde a um módulo do pacote `api/llm/`.
+O núcleo da aplicação é o pipeline abaixo. O backend é organizado por responsabilidade, e não por camada técnica: `api/rag/` cuida só do pipeline de recuperação, `api/llm/` só do provedor de IA, `api/prompt/` só do texto enviado ao modelo, e `api/chat/` orquestra os três para atender uma mensagem.
 
 | # | Etapa | Módulo responsável |
 |---|---|---|
-| 1 | Coleta do conteúdo do domínio | `load_documents.py` |
-| 2 | Limpeza e organização dos textos | `limpeza.py` |
-| 3 | Quebra do conteúdo em chunks | `chunk.py` |
-| 4 | Geração de embeddings | `vectorstore.py` |
-| 5 | Armazenamento em índice vetorial | `vectorstore.py` |
-| 6 | Recebimento da pergunta pela interface | `chat_router.py` / `chat.tsx` |
-| 7 | Recuperação dos chunks mais relevantes | `retriever.py` |
-| 8 | Montagem do contexto (chunks + histórico) | `retriever.py` / `chat_service.py` |
-| 9 | Geração da resposta final | `prompt.py` / `chat_service.py` |
-| 10 | Exibição da resposta no chat | `chat.tsx` |
+| 1 | Coleta do conteúdo do domínio | `rag/ingestion.py` |
+| 2 | Limpeza e organização dos textos | `rag/cleaning.py` |
+| 3 | Quebra do conteúdo em chunks | `rag/chunking.py` |
+| 4 | Geração de embeddings | `rag/embedding.py` |
+| 5 | Armazenamento em índice vetorial | `rag/vectorstore.py` |
+| 6 | Recebimento da pergunta pela interface | `chat/router.py` / `chat.tsx` |
+| 7 | Recuperação dos chunks mais relevantes | `chat/graph.py` (nó `recuperar`) + `rag/retrieval.py` |
+| 8 | Montagem do contexto (chunks + histórico) | `chat/graph.py` (nó `montar_prompt`) + `rag/retrieval.py` |
+| 9 | Geração da resposta final | `chat/graph.py` (nó `gerar`) + `llm/groq_provider.py` |
+| 10 | Exibição da resposta no chat | `chat/graph.py` (nó `retorno`) + `chat.tsx` |
+
+`rag/service.py` é a fachada que compõe ingestão + chunking + embedding + índice + recuperação num único `RagService`. `chat/graph.py` é quem orquestra as etapas 6 a 10 como um grafo — ver seção **Orquestração com LangGraph** abaixo.
 
 ## 1. Coleta
 
@@ -111,7 +113,7 @@ Ao contexto soma-se uma janela das últimas mensagens da conversa, limitada para
 
 ## 9. Geração
 
-Groq com Llama 3.3 70B, `temperature=0.1` (em RAG a resposta deve seguir o contexto, não ser criativa) e limite de tokens definido.
+Groq com `openai/gpt-oss-120b`, `temperature=0.1` (em RAG a resposta deve seguir o contexto, não ser criativa) e limite de tokens definido.
 
 O prompt do sistema obriga o modelo a responder somente com base no contexto, a citar `[Fonte X]` e a ignorar instruções embutidas na mensagem do usuário que tentem alterar essas regras.
 
@@ -120,6 +122,60 @@ O prompt do sistema obriga o modelo a responder somente com base no contexto, a 
 ## 10. Exibição
 
 A mensagem do usuário aparece imediatamente, há indicador de digitação enquanto a resposta é processada, e falhas de rede viram uma mensagem visível no chat. A conversa é persistida em `localStorage`.
+
+---
+
+# Orquestração com LangGraph
+
+As etapas 6 a 10 são organizadas como um `StateGraph` do LangGraph (`api/chat/graph.py`), não como uma função sequencial. Cada nó do grafo é fino de propósito — chama uma função já isolada em `api/rag/`, `api/llm/` ou `api/prompt/` — o grafo só decide a ordem e as bifurcações.
+
+```mermaid
+graph TD;
+	__start__([__start__]):::first
+	entrada(entrada)
+	recuperar(recuperar)
+	montar_prompt(montar_prompt)
+	abster(abster)
+	gerar(gerar)
+	executar_ferramenta(executar_ferramenta)
+	limite_atingido(limite_atingido)
+	retorno(retorno)
+	__end__([__end__]):::last
+	__start__ --> entrada;
+	entrada --> recuperar;
+	recuperar -.-> montar_prompt;
+	recuperar -.-> abster;
+	montar_prompt --> gerar;
+	gerar -. fim .-> retorno;
+	gerar -.-> executar_ferramenta;
+	gerar -. limite .-> limite_atingido;
+	executar_ferramenta -.-> gerar;
+	executar_ferramenta -.-> retorno;
+	abster --> retorno;
+	limite_atingido --> retorno;
+	retorno --> __end__;
+	classDef default fill:#f2f0ff
+	classDef first fill-opacity:0
+	classDef last fill:#bfb6fc
+```
+
+| Nó | Etapa | O que faz |
+|---|---|---|
+| `entrada` | 6 — entrada da pergunta | Sanitiza a mensagem; detecta se o turno é de agendamento |
+| `recuperar` | 6.5 e 7 — recuperação de contexto | Reformula a pergunta com o histórico, busca no índice vetorial, calcula score máximo e decide se há evidência |
+| `montar_prompt` | 8 — montagem do prompt | Filtra os chunks relevantes e monta o system prompt (contexto + serviços) |
+| `gerar` | 9 — chamada da LLM | Chama o Groq; extrai um eventual comando JSON de ferramenta da resposta |
+| `executar_ferramenta` | — | Executa a ferramenta pedida (consulta prestadores/horários, agenda) e realimenta o resultado |
+| `abster` | — | Resposta de abstenção sem acionar a LLM |
+| `limite_atingido` | — | Interrompe o ciclo de ferramentas após o limite de rodadas |
+| `retorno` | 10 — retorno da resposta | Garante que sempre há uma resposta não vazia a devolver |
+
+Duas arestas condicionais concentram as decisões do fluxo:
+
+- **`recuperar → montar_prompt | abster`**: a mesma lógica do material da disciplina — a busca vetorial sempre devolve os vizinhos mais próximos, então a decisão de acionar ou não a LLM é feita antes da geração, com base no score.
+- **`gerar → executar_ferramenta | limite_atingido | retorno`**: fecha um ciclo (`gerar ⇄ executar_ferramenta`) para o tool calling manual por JSON — uma extensão do fluxo básico de RAG, sugerida como evolução no material de referência (ferramentas, ciclos).
+
+`ChatService` (`api/chat/service.py`) ficou responsável só pelo que é externo ao grafo: obter/persistir a sessão da conversa e resolver a lista de serviços antes de invocar `ChatGraph.executar(...)`.
 
 ---
 
@@ -132,12 +188,12 @@ A mensagem do usuário aparece imediatamente, há indicador de digitação enqua
 
 ## Backend
 - Python + FastAPI
-- Camadas: `routers` → `controllers` → `services` → `repository` → `models`
-- `ChatService` como camada de orquestração
-- Pacote `api/llm/` com o pipeline de RAG
+- `prestador` e `horario_marcado`: camadas técnicas `routers` → `controllers` → `services` → `repository` → `models`
+- `chat`, `rag`, `llm` e `prompt`: módulos por responsabilidade (cada um resolve uma parte do pipeline de IA, independente dos demais)
+- `ChatService` (`api/chat/service.py`) delega a execução do turno a um `StateGraph` do LangGraph (`api/chat/graph.py`), que orquestra `RagService`, o provedor de LLM e as ferramentas
 
 ## IA
-- Groq — Llama 3.3 70B (geração)
+- Groq — `openai/gpt-oss-120b` (geração)
 - Sentence Transformers — MiniLM multilíngue (embeddings)
 - ChromaDB persistente (índice vetorial)
 
@@ -209,17 +265,34 @@ front-end/
 
 back-end/
   api/
-    llm/
-      limpeza.py          # etapa 2
-      load_documents.py   # etapa 1
-      chunk.py            # etapa 3
-      vectorstore.py      # etapas 4 e 5
-      retriever.py        # etapas 7 e 8
-      prompt.py           # etapa 9
-      carregar_servicos.py
-      indexar.py          # construção do índice via linha de comando
-    services/
-      chat_service.py     # orquestração
+    chat/                  # orquestração do assistente (feature module)
+      router.py            # etapa 6 — endpoint POST /chat/ e GET /chat/status
+      controller.py        # validação da requisição
+      service.py           # ChatService — obtém a sessão e invoca o grafo
+      graph.py             # StateGraph do LangGraph — etapas 6 a 10 (ver diagrama acima)
+      session_store.py     # histórico e estado de agendamento por sessão
+      tools.py             # tool calling: extrai e executa o JSON da LLM
+      turn_classifier.py   # heurísticas: turno é pergunta? é agendamento?
+
+    rag/                    # pipeline de RAG (feature module)
+      ingestion.py          # etapa 1 — leitura dos documentos
+      cleaning.py           # etapa 2 — limpeza do texto extraído
+      chunking.py           # etapa 3 — divisão em chunks
+      embedding.py          # etapa 4 — modelo de embeddings
+      vectorstore.py        # etapa 5 — índice ChromaDB persistente
+      retrieval.py          # etapas 7 e 8 — busca, evidência, contexto
+      service.py            # RagService — fachada que compõe tudo acima
+      cli.py                # indexação e diagnóstico via linha de comando
+
+    llm/                     # SÓ a configuração do provedor de IA em uso
+      base.py                # contrato LLMProvider (permite trocar de provedor)
+      groq_provider.py        # cliente Groq + parâmetros de geração (etapa 9)
+
+    prompt/                   # texto enviado à LLM
+      mika.py                 # persona + regras + frase de abstenção
+      servicos.py              # lista de serviços (dado de negócio no prompt)
+
+    services/                  # prestador e horario_marcado (CRUD simples)
       prestador_service.py
       horario_marcado_service.py
     routers/
@@ -227,9 +300,11 @@ back-end/
     repository/
     models/
     schemas/
-    docs/                 # PDFs indexados
-    vectorstore/          # índice gerado (não versionado)
+    docs/                       # PDFs indexados
+    vectorstore/                # índice gerado (não versionado)
 ```
+
+`prestador` e `horario_marcado` continuam na estrutura em camadas (`routers/`, `controllers/`, `services/`, `repository/`, `models/`) porque são CRUD convencional; `chat`, `rag`, `llm` e `prompt` são módulos verticais porque cada um é uma peça independente do pipeline de IA, testável e substituível por conta própria — por exemplo, trocar o Groq por outro provedor toca só em `api/llm/`.
 
 ---
 
@@ -239,7 +314,8 @@ back-end/
 |---|---|
 | Frontend | Next.js, React, Tailwind, Axios |
 | Backend | FastAPI, Python, SQLAlchemy, Pydantic |
-| Geração | Groq — Llama 3.3 70B |
+| Orquestração do fluxo de RAG | LangGraph |
+| Geração | Groq — `openai/gpt-oss-120b` |
 | Embeddings | Sentence Transformers — `paraphrase-multilingual-MiniLM-L12-v2` |
 | Índice vetorial | ChromaDB (persistente) |
 | Extração de PDF | pypdf |
@@ -273,7 +349,7 @@ Os parâmetros estão disponíveis no `.env` enviado por e-mail.
 ### Construir o índice vetorial
 
 ```bash
-python -m api.llm.indexar
+python -m api.rag.cli
 ```
 
 Na primeira execução o modelo de embeddings é baixado (~500 MB). O índice fica em `api/vectorstore/` e é reaproveitado nas execuções seguintes.
@@ -283,8 +359,8 @@ Na primeira execução o modelo de embeddings é baixado (~500 MB). O índice fi
 O limiar decide quando o assistente responde e quando se abstém. O valor padrão é didático e **deve ser calibrado** para a base em uso:
 
 ```bash
-python -m api.llm.indexar --testar "vocês aceitam convênio?"
-python -m api.llm.indexar --testar "qual é a capital da França?"
+python -m api.rag.cli --testar "vocês aceitam convênio?"
+python -m api.rag.cli --testar "qual é a capital da França?"
 ```
 
 O comando mostra o score de cada chunk recuperado e a decisão tomada. O limiar adequado fica entre o menor score das perguntas que a base responde e o maior score das que ela não responde. Ajuste em `rag_limiar_evidencia` no `.env`, sem alterar código.
@@ -329,7 +405,7 @@ Todos opcionais no `.env`, com valores padrão no código:
 | `rag_limiar_evidencia` | `0.35` | Score mínimo para responder |
 | `rag_chunk_tamanho` | `70` | Palavras por chunk |
 | `rag_chunk_overlap` | `15` | Palavras de sobreposição |
-| `llm_model` | `llama-3.3-70b-versatile` | Modelo de geração |
+| `llm_model` | `openai/gpt-oss-120b` | Modelo de geração |
 | `llm_temperature` | `0.1` | Criatividade da resposta |
 | `historico_max_mensagens` | `20` | Janela do histórico |
 | `max_passos_ferramenta` | `4` | Rodadas de tool calling por mensagem |
@@ -364,9 +440,10 @@ Alterar `rag_embedding_model`, `rag_chunk_tamanho` ou `rag_chunk_overlap` invali
 - **Limiar de evidência com abstenção**, porque a busca vetorial sempre devolve algo e a ausência de resposta precisa ser uma decisão explícita;
 - **Chunking por palavra dimensionado pela janela do modelo**, evitando truncamento silencioso;
 - **Citação de fonte**, tornando a resposta auditável;
-- **Tool calling manual por JSON**, contornando a ausência de suporte nativo no modelo;
+- **Tool calling manual por JSON**, contornando a ausência de suporte nativo no modelo, modelado como um ciclo no grafo (`gerar ⇄ executar_ferramenta`);
 - **Índice construído sob demanda**, e não no import do módulo, para o servidor subir imediatamente;
-- **Centralização da orquestração conversacional no ChatService**.
+- **Orquestração do fluxo principal com LangGraph** (`api/chat/graph.py`), em vez de uma função sequencial — as decisões de evidência e de tool calling viram arestas condicionais explícitas, e o grafo pode ser inspecionado (`get_graph().draw_mermaid()`);
+- **`ChatService` como fachada**, delegando a execução do turno ao `ChatGraph` e cuidando só do que fica fora do grafo (sessão, cache de serviços).
 
 ---
 
@@ -378,7 +455,9 @@ Alterar `rag_embedding_model`, `rag_chunk_tamanho` ou `rag_chunk_overlap` invali
 - O chat compartilha uma única sessão de banco entre requisições;
 - Sem autenticação e sem painel administrativo;
 - CORS liberado para qualquer origem;
-- O limiar de evidência precisa ser calibrado manualmente por domínio.
+- O limiar de evidência precisa ser calibrado manualmente por domínio;
+- O catálogo de modelos da Groq muda com o tempo (a família Llama 3.x usada originalmente foi descontinuada); se `llm_model` passar a devolver `model_not_found`, confira `client.models.list()` e atualize o padrão em `settings.py`;
+- A tabela `prestador` precisa ter ao menos um registro por serviço para o agendamento funcionar de ponta a ponta — sem isso, o assistente conduz a conversa mas não encontra profissional para oferecer.
 
 ---
 
