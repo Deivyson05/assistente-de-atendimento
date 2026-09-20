@@ -99,6 +99,20 @@ Abra `http://localhost:3000` — o chat aparece como um botão flutuante ("Assis
 
 ---
 
+## Executando com Docker
+
+Alternativa ao passo a passo acima: sobe backend e frontend juntos. Só precisa do `back-end/.env` (chave da Groq e `database_url`) já criado.
+
+```bash
+docker compose up --build
+```
+
+- Frontend: `http://localhost:3000` · Backend: `http://localhost:8000`
+- A primeira subida baixa o modelo de embeddings (~500 MB) e indexa os PDFs; o índice e o modelo ficam em volumes Docker, então as próximas subidas são rápidas.
+- O `NEXT_PUBLIC_BACKENDAPI` do frontend é fixado no **build** (`docker-compose.yml`, `args`); se mudar a porta do backend, rode `docker compose up --build` de novo.
+
+---
+
 ## Autor
 
 Deivyson Ricardo Silva dos Santos

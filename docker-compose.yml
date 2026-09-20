@@ -1,0 +1,29 @@
+services:
+  backend:
+    build: ./back-end
+    ports:
+      - "8000:8000"
+    # llm_api_key e database_url vem de back-end/.env (o mesmo arquivo do
+    # README); o .env nao e copiado para dentro da imagem.
+    env_file:
+      - ./back-end/.env
+    volumes:
+      # indice vetorial persistente: evita reindexar os PDFs a cada `up`
+      - vectorstore:/app/api/vectorstore
+      # cache do modelo de embeddings (~500 MB), baixado so na primeira vez
+      - hf_cache:/root/.cache/huggingface
+
+  frontend:
+    build:
+      context: ./front-end
+      args:
+        # endereco que o NAVEGADOR usa para chegar ao backend
+        NEXT_PUBLIC_BACKENDAPI: http://localhost:8000
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+
+volumes:
+  vectorstore:
+  hf_cache:
