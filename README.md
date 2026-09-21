@@ -1,3 +1,11 @@
+## Equipe
+
+- Deivyson Ricardo Silva dos Santos
+- Ingrid Beatriz Silva
+- Júlia Muniz Cavalheiro de Oliveira
+- Iwerson Guilherme da Silva Souza
+
+
 # Mika AI — Chatbot com RAG para a Mika Odonto
 
 Chatbot web que responde dúvidas em linguagem natural com base em uma base de conhecimento documental (RAG) e conduz o fluxo conversacional de agendamento de uma clínica odontológica fictícia — a **Mika Odonto**.
@@ -52,7 +60,21 @@ Pipeline de RAG: coleta → limpeza → chunking → embeddings → índice veto
 ```bash
 cd back-end
 python -m venv venv
-source venv/bin/activate          # Windows: .\venv\Scripts\activate
+```
+
+Ative o ambiente virtual (o comando depende do terminal):
+
+| Terminal | Comando |
+|---|---|
+| Windows — PowerShell | `.\venv\Scripts\Activate.ps1` |
+| Windows — CMD | `venv\Scripts\activate.bat` |
+| Linux / macOS / Git Bash | `source venv/bin/activate` |
+
+Se o PowerShell bloquear o script (erro de "execução de scripts desabilitada"), rode uma vez `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` e tente de novo.
+
+Depois, com o ambiente ativo:
+
+```bash
 pip install -r requirements.txt
 ```
 
@@ -112,7 +134,3 @@ docker compose up --build
 - O `NEXT_PUBLIC_BACKENDAPI` do frontend é fixado no **build** (`docker-compose.yml`, `args`); se mudar a porta do backend, rode `docker compose up --build` de novo.
 
 ---
-
-## Autor
-
-Deivyson Ricardo Silva dos Santos
