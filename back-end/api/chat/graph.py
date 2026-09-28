@@ -1,18 +1,8 @@
 """Orquestração do assistente como um grafo do LangGraph.
 
-Nós do fluxo principal, na ordem pedida pela atividade:
-
-    entrada -> recuperar -> [decidir_caminho] -> montar_prompt -> gerar -> retorno
-                                               -> abster ------------------> retorno
-
-`decidir_caminho` é a aresta condicional central do RAG: a busca vetorial
-SEMPRE devolve os k vizinhos mais próximos, mesmo quando nenhum responde à
-pergunta, então o grafo decide se há evidência suficiente ANTES de acionar a
-LLM. Sem evidência e sem ser um turno de agendamento, vai direto para
-`abster`, sem gastar uma chamada de LLM.
-
-O nó `gerar` pode pedir uma ferramenta (tool calling manual por JSON, já que o
-modelo não tem function calling nativo). Isso é modelado como um ciclo:
+O nó `gerar` decide se responde diretamente ou solicita uma ferramenta
+(tool calling manual por JSON, já que o modelo não tem function calling
+nativo). A busca no RAG e as operações de agendamento seguem o mesmo ciclo:
 
     gerar -> [decidir_ferramenta] -> executar_ferramenta -> gerar (de novo)
                                    -> limite_atingido -> retorno
@@ -27,8 +17,7 @@ from typing import TYPE_CHECKING, Literal, TypedDict
 from langgraph.graph import END, START, StateGraph
 
 from api.chat.tools import MARCADOR_FERRAMENTA, extrair_acao, sanitizar
-from api.chat.turn_classifier import parece_agendamento, parece_pergunta
-from api.prompt.mika import RESPOSTA_SEM_EVIDENCIA, build_system_prompt
+from api.prompt.mika import build_system_prompt
 from api.settings import settings
 
 if TYPE_CHECKING:
@@ -38,17 +27,10 @@ if TYPE_CHECKING:
 class ChatState(TypedDict, total=False):
     # fornecidos por ChatService ao invocar o grafo (etapa 6: entrada da pergunta)
     pergunta: str
-    session_id: str
     historico: list[dict]
-    em_agendamento: bool
     servicos: str
 
     # preenchidos pelos nós do grafo
-    query: str
-    recuperados: list[dict]
-    score_maximo: float
-    com_evidencia: bool
-    contexto: str
     system_prompt: str
     resposta: str
     acao: dict | None
@@ -59,8 +41,8 @@ class ChatState(TypedDict, total=False):
 class ChatGraph:
     """Compila e executa o StateGraph do assistente.
 
-    Guarda uma referência ao ChatService (não cópias de rag/llm/tools/sessions)
-    e lê `self.service.rag`, `.llm`, `.tools`, `.sessions` a cada execução de
+    Guarda uma referência ao ChatService (não cópias de llm/tools/sessions)
+    e lê `self.service.llm`, `.tools`, `.sessions` a cada execução de
     nó — assim trocar o provedor de LLM ou o RagService no ChatService depois
     de construído (comum em testes, que injetam um fake) continua valendo,
     em vez de o grafo ficar preso ao objeto que existia na hora da construção.
@@ -73,16 +55,12 @@ class ChatGraph:
     def executar(
         self,
         pergunta: str,
-        session_id: str,
         historico: list[dict],
-        em_agendamento: bool,
         servicos: str,
     ) -> ChatState:
         estado_inicial: ChatState = {
             "pergunta": pergunta,
-            "session_id": session_id,
             "historico": historico,
-            "em_agendamento": em_agendamento,
             "servicos": servicos,
             "chamadas_llm": 0,
         }
@@ -95,22 +73,14 @@ class ChatGraph:
         builder = StateGraph(ChatState)
 
         builder.add_node("entrada", self._no_entrada)
-        builder.add_node("recuperar", self._no_recuperar)
         builder.add_node("montar_prompt", self._no_montar_prompt)
-        builder.add_node("abster", self._no_abster)
         builder.add_node("gerar", self._no_gerar)
         builder.add_node("executar_ferramenta", self._no_executar_ferramenta)
         builder.add_node("limite_atingido", self._no_limite_atingido)
         builder.add_node("retorno", self._no_retorno)
 
         builder.add_edge(START, "entrada")
-        builder.add_edge("entrada", "recuperar")
-
-        builder.add_conditional_edges(
-            "recuperar",
-            self._decidir_caminho,
-            {"montar_prompt": "montar_prompt", "abster": "abster"},
-        )
+        builder.add_edge("entrada", "montar_prompt")
         builder.add_edge("montar_prompt", "gerar")
 
         builder.add_conditional_edges(
@@ -128,7 +98,6 @@ class ChatGraph:
             {"gerar": "gerar", "retorno": "retorno"},
         )
 
-        builder.add_edge("abster", "retorno")
         builder.add_edge("limite_atingido", "retorno")
         builder.add_edge("retorno", END)
 
@@ -139,70 +108,16 @@ class ChatGraph:
     # ------------------------------------------------------------------
     def _no_entrada(self, estado: ChatState) -> dict:
         pergunta = sanitizar(estado["pergunta"])
-        em_agendamento = estado["em_agendamento"] or parece_agendamento(pergunta)
-        return {"pergunta": pergunta, "em_agendamento": em_agendamento}
-
-    # ------------------------------------------------------------------
-    # Nó: recuperação de contexto (etapas 6.5 e 7)
-    # ------------------------------------------------------------------
-    def _no_recuperar(self, estado: ChatState) -> dict:
-        retriever = self.service.rag.get_retriever()
         historico = estado["historico"]
-
-        # reformulação: pergunta curta herda o assunto da pergunta anterior
-        query = retriever.montar_query(
-            estado["pergunta"], self.service.sessions.perguntas_anteriores(historico)
-        )
-        recuperados = retriever.recuperar(query)
-        score_maximo = retriever.score_maximo(recuperados)
-        com_evidencia = retriever.decidir_evidencia(recuperados)
-
-        if settings.debug:
-            print(
-                f"[RAG] sessao={estado['session_id']} score_max={score_maximo:.4f} "
-                f"limiar={settings.rag_limiar_evidencia} evidencia={com_evidencia} "
-                f"agendamento={estado['em_agendamento']} query={query!r}"
-            )
-
-        historico.append({"role": "user", "content": estado["pergunta"]})
-
-        return {
-            "historico": historico,
-            "query": query,
-            "recuperados": recuperados,
-            "score_maximo": score_maximo,
-            "com_evidencia": com_evidencia,
-        }
-
-    def _decidir_caminho(self, estado: ChatState) -> Literal["montar_prompt", "abster"]:
-        """Aresta condicional: só aciona a LLM quando há evidência (ou é agendamento)."""
-        sem_evidencia = not estado["com_evidencia"]
-        e_pergunta = parece_pergunta(estado["pergunta"])
-        if sem_evidencia and not estado["em_agendamento"] and e_pergunta:
-            return "abster"
-        return "montar_prompt"
+        historico.append({"role": "user", "content": pergunta})
+        return {"pergunta": pergunta, "historico": historico}
 
     # ------------------------------------------------------------------
-    # Nó: abstenção — pergunta sem evidência não chega a chamar a LLM
-    # ------------------------------------------------------------------
-    def _no_abster(self, estado: ChatState) -> dict:
-        historico = estado["historico"]
-        historico.append({"role": "assistant", "content": RESPOSTA_SEM_EVIDENCIA})
-        return {"historico": historico, "resposta": RESPOSTA_SEM_EVIDENCIA}
-
-    # ------------------------------------------------------------------
-    # Nó: montagem do prompt (etapa 8)
+    # Nó: montagem do prompt
     # ------------------------------------------------------------------
     def _no_montar_prompt(self, estado: ChatState) -> dict:
-        retriever = self.service.rag.get_retriever()
-        relevantes = (
-            retriever.filtrar_relevantes(estado["recuperados"])
-            if estado["com_evidencia"]
-            else []
-        )
-        contexto = retriever.montar_contexto(relevantes)
-        system_prompt = build_system_prompt(contexto, estado["servicos"])
-        return {"contexto": contexto, "system_prompt": system_prompt}
+        system_prompt = build_system_prompt(estado["servicos"])
+        return {"system_prompt": system_prompt}
 
     # ------------------------------------------------------------------
     # Nó: chamada da LLM (etapa 9)
@@ -263,7 +178,6 @@ class ChatGraph:
             return {
                 "historico": historico,
                 "resposta": sucesso,
-                "em_agendamento": False,
                 "finalizado": True,
             }
 

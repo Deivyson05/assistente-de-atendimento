@@ -42,7 +42,7 @@ Arquivos em [`back-end/api/docs/`](back-end/api/docs/), extraídos de PDF em tem
 | Índice vetorial | ChromaDB (persistente) |
 | Banco de dados | PostgreSQL (Neon) |
 
-Pipeline de RAG: coleta → limpeza → chunking → embeddings → índice vetorial → recuperação (com limiar de evidência e abstenção) → montagem do contexto (chunks + histórico da conversa) → geração pela LLM → exibição no chat. Essas cinco últimas etapas são orquestradas como um `StateGraph` do LangGraph (`back-end/api/chat/graph.py`). Detalhes de cada etapa e o diagrama do grafo em [DOCS.md](DOCS.md#pipeline-de-rag).
+Pipeline de RAG: coleta → limpeza → chunking → embeddings → índice vetorial → recuperação sob demanda pela tool `consultar_rag` (com limiar de evidência e abstenção) → retorno do contexto à LLM → geração da resposta. A LLM escolhe essa tool para dúvidas e usa as tools de negócio para buscar profissionais, verificar horários e agendar. O ciclo é orquestrado por um `StateGraph` do LangGraph (`back-end/api/chat/graph.py`). Detalhes e diagrama em [DOCS.md](DOCS.md#pipeline-de-rag).
 
 ---
 

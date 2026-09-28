@@ -2,8 +2,8 @@
 
 Como o modelo usado (Groq/Llama) não tem suporte nativo a function calling, o
 prompt instrui a LLM a emitir um bloco ```json com uma ação; este módulo
-extrai esse bloco e executa a ação real (consultar prestadores, consultar
-horários, agendar).
+extrai esse bloco e executa a ação real (consultar a base documental, buscar
+prestadores, consultar horários ou agendar).
 """
 
 import json
@@ -55,12 +55,16 @@ def extrair_acao(resposta: str) -> tuple[dict | None, str]:
 class ToolRouter:
     """Executa as ações que a LLM pode emitir, contra os serviços reais."""
 
-    def __init__(self, prestador_service, horario_marcado_service):
+    def __init__(self, prestador_service, horario_marcado_service, rag_service):
         self.prestador_service = prestador_service
         self.horario_marcado_service = horario_marcado_service
+        self.rag_service = rag_service
 
     def executar(self, acao: dict) -> str:
         nome = acao.get("action")
+
+        if nome == "consultar_rag":
+            return self._consultar_rag(acao)
 
         if nome == "get_prestadores_servico":
             prestadores = self.prestador_service.get_by_servico(acao["servico"])
@@ -86,6 +90,28 @@ class ToolRouter:
             return self._agendar(acao)
 
         return json.dumps({"erro": "Ferramenta não encontrada"}, ensure_ascii=False)
+
+    def _consultar_rag(self, acao: dict) -> str:
+        query = acao["query"].strip()
+        retriever = self.rag_service.get_retriever()
+        recuperados = retriever.recuperar(query)
+        score_maximo = retriever.score_maximo(recuperados)
+        com_evidencia = retriever.decidir_evidencia(recuperados)
+        relevantes = retriever.filtrar_relevantes(recuperados) if com_evidencia else []
+
+        if com_evidencia:
+            resultado = {
+                "com_evidencia": True,
+                "contexto": retriever.montar_contexto(relevantes),
+                "score_maximo": score_maximo,
+            }
+        else:
+            resultado = {
+                "com_evidencia": False,
+                "resposta": "Nao encontrei essa informacao na base consultada.",
+            }
+
+        return json.dumps(resultado, ensure_ascii=False)
 
     def _agendar(self, acao: dict) -> str:
         from api.schemas.horario_marcado_schema import HorarioMarcadoCreate
