@@ -46,8 +46,8 @@ O núcleo da aplicação é o pipeline abaixo. O backend é organizado por respo
 | 4 | Geração de embeddings | `rag/embedding.py` |
 | 5 | Armazenamento em índice vetorial | `rag/vectorstore.py` |
 | 6 | Recebimento da pergunta pela interface | `chat/router.py` / `chat.tsx` |
-| 7 | Recuperação dos chunks mais relevantes | `chat/graph.py` (nó `recuperar`) + `rag/retrieval.py` |
-| 8 | Montagem do contexto (chunks + histórico) | `chat/graph.py` (nó `montar_prompt`) + `rag/retrieval.py` |
+| 7 | Recuperação dos chunks mais relevantes, quando a LLM escolhe consultar o RAG | `chat/tools.py` + `rag/retrieval.py` |
+| 8 | Montagem do contexto (chunks + fontes) | `rag/retrieval.py` |
 | 9 | Geração da resposta final | `chat/graph.py` (nó `gerar`) + `llm/groq_provider.py` |
 | 10 | Exibição da resposta no chat | `chat/graph.py` (nó `retorno`) + `chat.tsx` |
 
@@ -90,13 +90,16 @@ O índice guarda uma impressão digital da pasta de documentos (nome, tamanho e 
 
 `POST /chat/` recebe `{ message, session_id }`. O `session_id` é gerado no navegador e guardado em `localStorage`, mantendo o histórico da conversa entre mensagens.
 
-## 7. Recuperação
+## 7. Recuperação (tool `consultar_rag`)
 
-Busca vetorial pelos `top_k` chunks mais próximos, preservando **score e metadados**.
+O modelo escolhe quando uma pergunta exige informação documental e solicita
+`consultar_rag`; perguntas de agendamento seguem diretamente para as ferramentas
+de negócio. A tool faz a busca vetorial pelos `top_k` chunks mais próximos,
+preservando **score e metadados**.
 
 Dois mecanismos são aplicados sobre o resultado:
 
-**Reformulação da pergunta.** Perguntas curtas costumam ser anafóricas — "e quanto custa?" não carrega assunto nenhum. Quando a mensagem tem menos de 6 palavras, a pergunta anterior do usuário é concatenada antes de gerar o vetor de busca.
+**Reformulação da pergunta.** O modelo recebe o histórico e deve contextualizar a consulta emitida pela tool para perguntas curtas ou anafóricas — por exemplo, "e quanto custa?".
 
 **Limiar de evidência.** A busca vetorial *sempre* devolve os vizinhos mais próximos, mesmo quando nenhum deles responde à pergunta. O score máximo é comparado com um limiar configurável; abaixo dele, considera-se que não há evidência. Chunks muito abaixo do topo do ranking também são descartados, porque só consomem contexto.
 
@@ -109,15 +112,22 @@ Os chunks aprovados viram um contexto rotulado por fonte:
 <trecho do documento>
 ```
 
-Ao contexto soma-se uma janela das últimas mensagens da conversa, limitada para não crescer indefinidamente.
+O contexto é devolvido pela tool à LLM, que responde com base nos trechos e
+preserva as citações de fonte.
 
 ## 9. Geração
 
 Groq com `openai/gpt-oss-120b`, `temperature=0.1` (em RAG a resposta deve seguir o contexto, não ser criativa) e limite de tokens definido.
 
-O prompt do sistema obriga o modelo a responder somente com base no contexto, a citar `[Fonte X]` e a ignorar instruções embutidas na mensagem do usuário que tentem alterar essas regras.
+O prompt do sistema orienta o modelo a escolher entre consultar o RAG para
+dúvidas factuais da clínica ou usar as ferramentas de negócio para buscar
+profissionais, verificar horários e agendar. Depois de consultar o RAG, deve
+responder somente com base no contexto retornado e citar a fonte.
 
-**Abstenção:** se não há evidência e o turno é uma pergunta, o assistente responde *"Não encontrei essa informação na base consultada."* sem sequer chamar a LLM. A abstenção é suprimida durante um agendamento em andamento, onde a mensagem do usuário é um dado do fluxo e não uma pergunta à base.
+**Abstenção:** quando o RAG não encontra evidência suficiente, sua tool retorna
+esse resultado à LLM, que responde *"Nao encontrei essa informacao na base
+consultada."*. A escolha de consultar o RAG e a resposta de abstenção passam,
+portanto, pelo modelo.
 
 ## 10. Exibição
 
@@ -133,25 +143,20 @@ As etapas 6 a 10 são organizadas como um `StateGraph` do LangGraph (`api/chat/g
 graph TD;
 	__start__([__start__]):::first
 	entrada(entrada)
-	recuperar(recuperar)
 	montar_prompt(montar_prompt)
-	abster(abster)
 	gerar(gerar)
 	executar_ferramenta(executar_ferramenta)
 	limite_atingido(limite_atingido)
 	retorno(retorno)
 	__end__([__end__]):::last
 	__start__ --> entrada;
-	entrada --> recuperar;
-	recuperar -.-> montar_prompt;
-	recuperar -.-> abster;
+	entrada --> montar_prompt;
 	montar_prompt --> gerar;
 	gerar -. fim .-> retorno;
 	gerar -.-> executar_ferramenta;
 	gerar -. limite .-> limite_atingido;
 	executar_ferramenta -.-> gerar;
 	executar_ferramenta -.-> retorno;
-	abster --> retorno;
 	limite_atingido --> retorno;
 	retorno --> __end__;
 	classDef default fill:#f2f0ff
@@ -161,19 +166,16 @@ graph TD;
 
 | Nó | Etapa | O que faz |
 |---|---|---|
-| `entrada` | 6 — entrada da pergunta | Sanitiza a mensagem; detecta se o turno é de agendamento |
-| `recuperar` | 6.5 e 7 — recuperação de contexto | Reformula a pergunta com o histórico, busca no índice vetorial, calcula score máximo e decide se há evidência |
-| `montar_prompt` | 8 — montagem do prompt | Filtra os chunks relevantes e monta o system prompt (contexto + serviços) |
-| `gerar` | 9 — chamada da LLM | Chama o Groq; extrai um eventual comando JSON de ferramenta da resposta |
-| `executar_ferramenta` | — | Executa a ferramenta pedida (consulta prestadores/horários, agenda) e realimenta o resultado |
-| `abster` | — | Resposta de abstenção sem acionar a LLM |
+| `entrada` | 6 — entrada da pergunta | Sanitiza a mensagem e atualiza o histórico |
+| `montar_prompt` | Montagem do prompt | Monta o system prompt com instruções de roteamento e serviços disponíveis |
+| `gerar` | Chamada da LLM | Chama o Groq; extrai um eventual comando JSON de ferramenta da resposta |
+| `executar_ferramenta` | — | Executa a ferramenta pedida (`consultar_rag`, consulta prestadores/horários ou agenda) e realimenta o resultado |
 | `limite_atingido` | — | Interrompe o ciclo de ferramentas após o limite de rodadas |
 | `retorno` | 10 — retorno da resposta | Garante que sempre há uma resposta não vazia a devolver |
 
-Duas arestas condicionais concentram as decisões do fluxo:
+O ciclo de ferramentas concentra o roteamento:
 
-- **`recuperar → montar_prompt | abster`**: a mesma lógica do material da disciplina — a busca vetorial sempre devolve os vizinhos mais próximos, então a decisão de acionar ou não a LLM é feita antes da geração, com base no score.
-- **`gerar → executar_ferramenta | limite_atingido | retorno`**: fecha um ciclo (`gerar ⇄ executar_ferramenta`) para o tool calling manual por JSON — uma extensão do fluxo básico de RAG, sugerida como evolução no material de referência (ferramentas, ciclos).
+- **`gerar → executar_ferramenta | limite_atingido | retorno`**: o modelo decide se responde diretamente ou solicita uma ferramenta; o resultado é realimentado no ciclo (`gerar ⇄ executar_ferramenta`).
 
 `ChatService` (`api/chat/service.py`) ficou responsável só pelo que é externo ao grafo: obter/persistir a sessão da conversa e resolver a lista de serviços antes de invocar `ChatGraph.executar(...)`.
 
@@ -209,27 +211,18 @@ Usuário envia mensagem
         ↓
 Frontend envia para a API
         ↓
-ChatService reformula a pergunta com o histórico
+ChatService prepara a sessão e o prompt com histórico
         ↓
-Recuperação no índice vetorial  →  score máximo
+LLM decide se responde ou emite um comando JSON
         ↓
-        ├── sem evidência + é pergunta  →  abstenção (não chama a LLM)
-        │
-        └── com evidência ou agendamento
-                ↓
-        Monta contexto [Fonte X] + janela do histórico
-                ↓
-        LLM gera a resposta
-                ↓
         ├── resposta em texto  →  devolve ao usuário
         │
-        └── comando JSON  →  backend executa a ação
-                                ↓
-                        consulta prestadores
-                        consulta horários ocupados
-                        cria agendamento
-                                ↓
-                        realimenta a LLM (até 4 rodadas)
+        └── comando JSON  →  backend executa a tool escolhida
+                                ├── consultar_rag → busca e contexto com fontes
+                                ├── buscar prestadores / horários ocupados
+                                └── agendar após confirmação explícita
+                                        ↓
+                                realimenta a LLM (até 4 rodadas)
 ```
 
 ---
@@ -270,9 +263,8 @@ back-end/
       controller.py        # validação da requisição
       service.py           # ChatService — obtém a sessão e invoca o grafo
       graph.py             # StateGraph do LangGraph — etapas 6 a 10 (ver diagrama acima)
-      session_store.py     # histórico e estado de agendamento por sessão
+      session_store.py     # histórico e janela enviada à LLM por sessão
       tools.py             # tool calling: extrai e executa o JSON da LLM
-      turn_classifier.py   # heurísticas: turno é pergunta? é agendamento?
 
     rag/                    # pipeline de RAG (feature module)
       ingestion.py          # etapa 1 — leitura dos documentos
@@ -437,12 +429,12 @@ Alterar `rag_embedding_model`, `rag_chunk_tamanho` ou `rag_chunk_overlap` invali
 
 - **Modelo de embedding multilíngue**, sem o qual a recuperação em português não funciona;
 - **Índice persistente em disco**, para não regerar os embeddings a cada inicialização;
-- **Limiar de evidência com abstenção**, porque a busca vetorial sempre devolve algo e a ausência de resposta precisa ser uma decisão explícita;
+- **Limiar de evidência com abstenção**, aplicado pela tool RAG que o modelo escolhe quando precisa de informação documental;
 - **Chunking por palavra dimensionado pela janela do modelo**, evitando truncamento silencioso;
 - **Citação de fonte**, tornando a resposta auditável;
 - **Tool calling manual por JSON**, contornando a ausência de suporte nativo no modelo, modelado como um ciclo no grafo (`gerar ⇄ executar_ferramenta`);
 - **Índice construído sob demanda**, e não no import do módulo, para o servidor subir imediatamente;
-- **Orquestração do fluxo principal com LangGraph** (`api/chat/graph.py`), em vez de uma função sequencial — as decisões de evidência e de tool calling viram arestas condicionais explícitas, e o grafo pode ser inspecionado (`get_graph().draw_mermaid()`);
+- **Orquestração do fluxo principal com LangGraph** (`api/chat/graph.py`), em vez de uma função sequencial — o ciclo de tool calling pode ser inspecionado (`get_graph().draw_mermaid()`);
 - **`ChatService` como fachada**, delegando a execução do turno ao `ChatGraph` e cuidando só do que fica fora do grafo (sessão, cache de serviços).
 
 ---

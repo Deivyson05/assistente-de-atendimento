@@ -1,4 +1,4 @@
-"""Orquestração do assistente: RAG para dúvidas + fluxo conversacional de agendamento.
+"""Orquestração do assistente e fluxo conversacional de agendamento.
 
 O fluxo em si (etapas 6 a 10) é um grafo do LangGraph — ver api/chat/graph.py.
 Este módulo cuida do que fica FORA do grafo, por request: obter/persistir a
@@ -34,7 +34,7 @@ class ChatService:
     ):
         self.llm = llm or GroqProvider()
         self.rag = rag or RagService(docs_folder)
-        self.tools = ToolRouter(prestador_service, horario_marcado_service)
+        self.tools = ToolRouter(prestador_service, horario_marcado_service, self.rag)
         self.sessions = SessionStore(settings.historico_max_mensagens)
         self.graph = ChatGraph(self)
 
@@ -70,12 +70,9 @@ class ChatService:
 
         resultado = self.graph.executar(
             pergunta=message,
-            session_id=session_id,
             historico=sessao["historico"],
-            em_agendamento=sessao["em_agendamento"],
             servicos=self._servicos(),
         )
 
         sessao["historico"] = resultado["historico"]
-        sessao["em_agendamento"] = resultado.get("em_agendamento", sessao["em_agendamento"])
         return resultado["resposta"]
