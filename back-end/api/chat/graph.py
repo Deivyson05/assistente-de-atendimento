@@ -2,8 +2,10 @@
 
 O nó `gerar` decide se responde diretamente ou solicita uma ferramenta
 (tool calling manual por JSON, já que o modelo não tem function calling
-nativo). A busca no RAG e as operações de agendamento seguem o mesmo ciclo:
+nativo). O RAG recupera contexto antes da geração; as operações de
+agendamento seguem este ciclo:
 
+    entrada -> recuperar -> montar_prompt -> gerar
     gerar -> [decidir_ferramenta] -> executar_ferramenta -> gerar (de novo)
                                    -> limite_atingido -> retorno
                                    -> retorno (resposta pronta, sem ferramenta)
@@ -31,6 +33,7 @@ class ChatState(TypedDict, total=False):
     servicos: str
 
     # preenchidos pelos nós do grafo
+    contexto: str
     system_prompt: str
     resposta: str
     acao: dict | None
@@ -42,8 +45,8 @@ class ChatGraph:
     """Compila e executa o StateGraph do assistente.
 
     Guarda uma referência ao ChatService (não cópias de llm/tools/sessions)
-    e lê `self.service.llm`, `.tools`, `.sessions` a cada execução de
-    nó — assim trocar o provedor de LLM ou o RagService no ChatService depois
+    e lê `self.service.llm`, `.tools`, `.sessions` e `.rag` a cada execução
+    de nó — assim trocar o provedor de LLM ou o RagService no ChatService depois
     de construído (comum em testes, que injetam um fake) continua valendo,
     em vez de o grafo ficar preso ao objeto que existia na hora da construção.
     """
@@ -73,6 +76,7 @@ class ChatGraph:
         builder = StateGraph(ChatState)
 
         builder.add_node("entrada", self._no_entrada)
+        builder.add_node("recuperar", self._no_recuperar)
         builder.add_node("montar_prompt", self._no_montar_prompt)
         builder.add_node("gerar", self._no_gerar)
         builder.add_node("executar_ferramenta", self._no_executar_ferramenta)
@@ -80,7 +84,8 @@ class ChatGraph:
         builder.add_node("retorno", self._no_retorno)
 
         builder.add_edge(START, "entrada")
-        builder.add_edge("entrada", "montar_prompt")
+        builder.add_edge("entrada", "recuperar")
+        builder.add_edge("recuperar", "montar_prompt")
         builder.add_edge("montar_prompt", "gerar")
 
         builder.add_conditional_edges(
@@ -112,11 +117,36 @@ class ChatGraph:
         historico.append({"role": "user", "content": pergunta})
         return {"pergunta": pergunta, "historico": historico}
 
+    def _no_recuperar(self, estado: ChatState) -> dict:
+        retriever = self.service.rag.get_retriever()
+        historico_anterior = estado["historico"][:-1]
+        perguntas_anteriores = [
+            mensagem["content"]
+            for mensagem in historico_anterior
+            if mensagem.get("role") == "user"
+            and isinstance(mensagem.get("content"), str)
+            and MARCADOR_FERRAMENTA not in mensagem["content"]
+        ]
+        query = retriever.montar_query(estado["pergunta"], perguntas_anteriores)
+        recuperados = retriever.recuperar(query)
+        com_evidencia = retriever.decidir_evidencia(recuperados)
+
+        if settings.debug:
+            print(
+                f"[RAG] score_max={retriever.score_maximo(recuperados):.4f} "
+                f"limiar={retriever.limiar} evidencia={com_evidencia} "
+                f"query={query!r}"
+            )
+
+        relevantes = retriever.filtrar_relevantes(recuperados) if com_evidencia else []
+        contexto = retriever.montar_contexto(relevantes)
+        return {"contexto": contexto}
+
     # ------------------------------------------------------------------
     # Nó: montagem do prompt
     # ------------------------------------------------------------------
     def _no_montar_prompt(self, estado: ChatState) -> dict:
-        system_prompt = build_system_prompt(estado["servicos"])
+        system_prompt = build_system_prompt(estado["contexto"], estado["servicos"])
         return {"system_prompt": system_prompt}
 
     # ------------------------------------------------------------------
