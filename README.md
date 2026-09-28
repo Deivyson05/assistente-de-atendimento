@@ -37,12 +37,12 @@ Arquivos em [`back-end/api/docs/`](back-end/api/docs/), extraídos de PDF em tem
 | Frontend | Next.js (App Router), React, Tailwind |
 | Backend | Python, FastAPI |
 | Orquestração do fluxo de RAG | **LangGraph** |
-| Geração da resposta (LLM externa) | Groq — `openai/gpt-oss-120b` |
+| Geração da resposta (LLM externa) | Groq — `qwen/qwen3.8-27b` |
 | Embeddings | Sentence Transformers — `paraphrase-multilingual-MiniLM-L12-v2` (local, não usa API externa) |
 | Índice vetorial | ChromaDB (persistente) |
 | Banco de dados | PostgreSQL (Neon) |
 
-Pipeline de RAG: coleta → limpeza → chunking → embeddings → índice vetorial → recuperação sob demanda pela tool `consultar_rag` (com limiar de evidência e abstenção) → retorno do contexto à LLM → geração da resposta. A LLM escolhe essa tool para dúvidas e usa as tools de negócio para buscar profissionais, verificar horários e agendar. O ciclo é orquestrado por um `StateGraph` do LangGraph (`back-end/api/chat/graph.py`). Detalhes e diagrama em [DOCS.md](DOCS.md#pipeline-de-rag).
+Pipeline de RAG: coleta → limpeza → chunking → embeddings → índice vetorial → recuperação automática antes da geração (com limiar de evidência e abstenção) → inclusão do contexto no prompt → resposta baseada nos documentos. As ferramentas de negócio são usadas para buscar profissionais, verificar horários e agendar. O ciclo é orquestrado por um `StateGraph` do LangGraph (`back-end/api/chat/graph.py`). Detalhes e diagrama em [DOCS.md](DOCS.md#pipeline-de-rag).
 
 ---
 

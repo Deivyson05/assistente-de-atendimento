@@ -46,7 +46,7 @@ O núcleo da aplicação é o pipeline abaixo. O backend é organizado por respo
 | 4 | Geração de embeddings | `rag/embedding.py` |
 | 5 | Armazenamento em índice vetorial | `rag/vectorstore.py` |
 | 6 | Recebimento da pergunta pela interface | `chat/router.py` / `chat.tsx` |
-| 7 | Recuperação dos chunks mais relevantes, quando a LLM escolhe consultar o RAG | `chat/tools.py` + `rag/retrieval.py` |
+| 7 | Recuperação automática dos chunks mais relevantes antes da geração | `chat/graph.py` + `rag/retrieval.py` |
 | 8 | Montagem do contexto (chunks + fontes) | `rag/retrieval.py` |
 | 9 | Geração da resposta final | `chat/graph.py` (nó `gerar`) + `llm/groq_provider.py` |
 | 10 | Exibição da resposta no chat | `chat/graph.py` (nó `retorno`) + `chat.tsx` |
@@ -90,16 +90,18 @@ O índice guarda uma impressão digital da pasta de documentos (nome, tamanho e 
 
 `POST /chat/` recebe `{ message, session_id }`. O `session_id` é gerado no navegador e guardado em `localStorage`, mantendo o histórico da conversa entre mensagens.
 
-## 7. Recuperação (tool `consultar_rag`)
+## 7. Recuperação
 
-O modelo escolhe quando uma pergunta exige informação documental e solicita
-`consultar_rag`; perguntas de agendamento seguem diretamente para as ferramentas
-de negócio. A tool faz a busca vetorial pelos `top_k` chunks mais próximos,
-preservando **score e metadados**.
+O grafo consulta o RAG antes de cada geração e inclui no prompt os `top_k`
+chunks mais próximos, preservando **score e metadados**. Isso torna a
+recuperação independente da decisão do modelo; as ferramentas de negócio
+continuam sendo escolhidas pelo modelo para buscar profissionais, verificar
+horários e agendar.
 
 Dois mecanismos são aplicados sobre o resultado:
 
-**Reformulação da pergunta.** O modelo recebe o histórico e deve contextualizar a consulta emitida pela tool para perguntas curtas ou anafóricas — por exemplo, "e quanto custa?".
+**Reformulação da pergunta.** Perguntas curtas ou anafóricas — por exemplo,
+"e quanto custa?" — são combinadas com a pergunta anterior antes da busca.
 
 **Limiar de evidência.** A busca vetorial *sempre* devolve os vizinhos mais próximos, mesmo quando nenhum deles responde à pergunta. O score máximo é comparado com um limiar configurável; abaixo dele, considera-se que não há evidência. Chunks muito abaixo do topo do ranking também são descartados, porque só consomem contexto.
 
@@ -112,22 +114,23 @@ Os chunks aprovados viram um contexto rotulado por fonte:
 <trecho do documento>
 ```
 
-O contexto é devolvido pela tool à LLM, que responde com base nos trechos e
+O contexto é incluído no prompt da LLM, que responde com base nos trechos e
 preserva as citações de fonte.
 
 ## 9. Geração
 
-Groq com `openai/gpt-oss-120b`, `temperature=0.1` (em RAG a resposta deve seguir o contexto, não ser criativa) e limite de tokens definido.
+Groq com `qwen/qwen3.8-27b` por padrão, `temperature=0.1` (em RAG a resposta
+deve seguir o contexto, não ser criativa) e limite de tokens definido. O modelo
+pode ser sobrescrito pela variável `LLM_MODEL`.
 
-O prompt do sistema orienta o modelo a escolher entre consultar o RAG para
-dúvidas factuais da clínica ou usar as ferramentas de negócio para buscar
-profissionais, verificar horários e agendar. Depois de consultar o RAG, deve
-responder somente com base no contexto retornado e citar a fonte.
+O prompt do sistema inclui os trechos recuperados e orienta o modelo a
+responder dúvidas factuais somente com base nesse contexto, citando a fonte.
+Para operações de agenda, o modelo usa os comandos JSON das ferramentas de
+negócio.
 
-**Abstenção:** quando o RAG não encontra evidência suficiente, sua tool retorna
-esse resultado à LLM, que responde *"Nao encontrei essa informacao na base
-consultada."*. A escolha de consultar o RAG e a resposta de abstenção passam,
-portanto, pelo modelo.
+**Abstenção:** quando o RAG não encontra evidência suficiente, o prompt informa
+que não há contexto relevante e orienta a resposta *"Nao encontrei essa
+informacao na base consultada."*.
 
 ## 10. Exibição
 
@@ -195,7 +198,7 @@ O ciclo de ferramentas concentra o roteamento:
 - `ChatService` (`api/chat/service.py`) delega a execução do turno a um `StateGraph` do LangGraph (`api/chat/graph.py`), que orquestra `RagService`, o provedor de LLM e as ferramentas
 
 ## IA
-- Groq — `openai/gpt-oss-120b` (geração)
+- Groq — `qwen/qwen3.8-27b` (geração por padrão; configurável por `LLM_MODEL`)
 - Sentence Transformers — MiniLM multilíngue (embeddings)
 - ChromaDB persistente (índice vetorial)
 
@@ -307,7 +310,7 @@ back-end/
 | Frontend | Next.js, React, Tailwind, Axios |
 | Backend | FastAPI, Python, SQLAlchemy, Pydantic |
 | Orquestração do fluxo de RAG | LangGraph |
-| Geração | Groq — `openai/gpt-oss-120b` |
+| Geração | Groq — `qwen/qwen3.8-27b` |
 | Embeddings | Sentence Transformers — `paraphrase-multilingual-MiniLM-L12-v2` |
 | Índice vetorial | ChromaDB (persistente) |
 | Extração de PDF | pypdf |
@@ -397,7 +400,7 @@ Todos opcionais no `.env`, com valores padrão no código:
 | `rag_limiar_evidencia` | `0.35` | Score mínimo para responder |
 | `rag_chunk_tamanho` | `70` | Palavras por chunk |
 | `rag_chunk_overlap` | `15` | Palavras de sobreposição |
-| `llm_model` | `openai/gpt-oss-120b` | Modelo de geração |
+| `llm_model` | `qwen/qwen3.8-27b` | Modelo de geração |
 | `llm_temperature` | `0.1` | Criatividade da resposta |
 | `historico_max_mensagens` | `20` | Janela do histórico |
 | `max_passos_ferramenta` | `4` | Rodadas de tool calling por mensagem |
