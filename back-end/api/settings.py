@@ -14,11 +14,10 @@ class Settings(BaseSettings):
     debug: bool = False  # valor padrão
 
     # --- Modelo de geração (Groq) ---
-    # A Groq descontinuou a família Llama 3.x (llama-3.3-70b-versatile passou a
-    # devolver 404 model_not_found). gpt-oss-120b é o substituto mais próximo em
-    # porte/capacidade disponível na conta; veja `client.models.list()` para a
-    # lista atual caso a Groq mude o catálogo de novo.
-    llm_model: str = "openai/gpt-oss-120b"
+    # Qwen evita as chamadas de ferramentas embutidas do GPT-OSS; o chat usa
+    # comandos JSON próprios e não disponibiliza ferramentas nativas à Groq.
+    # Pode ser sobrescrito por LLM_MODEL; confira o catálogo da Groq se mudar.
+    llm_model: str = "qwen/qwen3.8-27b"
     # Temperatura baixa: em RAG a resposta deve seguir o contexto, não ser criativa.
     llm_temperature: float = 0.1
     llm_max_tokens: int = 800
